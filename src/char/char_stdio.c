@@ -123,6 +123,48 @@ char_stdio_stdin_thread(void *priv)
     dev->thread_in = NULL;
     dev->fd_in     = INVALID_HANDLE_VALUE;
 }
+
+/* Input thread for a real console.
+
+   Polling the console from char_stdio_read() meant a GetNumberOfConsoleInputEvents
+   call into conhost on every receive timer tick, which is expensive enough to cost
+   a significant part of the emulator's speed. Doing it here keeps it off the
+   emulation thread.
+
+   The wait is bounded rather than indefinite because CancelIoEx does not reliably
+   unblock a console read, and close() has to be able to stop this thread. */
+static void
+char_stdio_console_thread(void *priv)
+{
+    char_stdio_t *dev = (char_stdio_t *) priv;
+
+    while (CHAR_FD_VALID(dev->fd_in)) {
+        if (WaitForSingleObject(dev->fd_in, 100) != WAIT_OBJECT_0)
+            continue;
+
+        if (!CHAR_FD_VALID(dev->fd_in))
+            break;
+
+        INPUT_RECORD ir;
+        DWORD        count = 0;
+
+        if (!ReadConsoleInput(dev->fd_in, &ir, 1, &count))
+            break;
+
+        if ((count == 0) || (ir.EventType != KEY_EVENT) || !ir.Event.KeyEvent.bKeyDown
+            || !ir.Event.KeyEvent.uChar.AsciiChar)
+            continue;
+
+        /* Hand the byte over the same way the redirected path does. */
+        dev->buf_in       = (uint8_t) ir.Event.KeyEvent.uChar.AsciiChar;
+        dev->buf_in_valid = 1;
+        thread_wait_event(dev->event_in, -1);
+        thread_reset_event(dev->event_in);
+    }
+
+    dev->thread_in = NULL;
+    dev->fd_in     = INVALID_HANDLE_VALUE;
+}
 #endif
 
 static size_t
@@ -142,19 +184,9 @@ char_stdio_read(uint8_t *buf, size_t len, void *priv)
         }
     }
 
+    /* Both kinds of stdin are read by a thread now, so there is nothing to
+       poll here. */
     size_t ret = 0;
-    if (CHAR_FD_VALID(dev->fd_in)) {
-        while (len-- > 0) {
-            DWORD count;
-            if (GetNumberOfConsoleInputEvents(dev->fd_in, &count) && (count > 0)) {
-                INPUT_RECORD ir;
-                if (ReadConsoleInput(dev->fd_in, &ir, 1, &count) && (count > 0) && (ir.EventType == KEY_EVENT) && ir.Event.KeyEvent.bKeyDown && ir.Event.KeyEvent.uChar.AsciiChar) {
-                    *buf++ = ir.Event.KeyEvent.uChar.AsciiChar;
-                    ret++;
-                }
-            }
-        }
-    }
 #else
     ssize_t ret = 0;
     if (CHAR_FD_VALID(dev->fd_in)) {
@@ -342,6 +374,11 @@ char_stdio_init(const device_t *info)
             /* Proper console (CLI executable or spawned earlier), enable raw and ANSI output and use console events. */
             if (!SetConsoleMode(dev->fd_in, ENABLE_VIRTUAL_TERMINAL_INPUT | ENABLE_EXTENDED_FLAGS)) /* ENABLE_EXTENDED_FLAGS disables quickedit */
                 char_stdio_log(dev->log, "Input SetConsoleMode failed (%08X)\n", GetLastError());
+
+            /* Read it on a thread, so the emulation thread never calls into
+               the console host. */
+            dev->event_in  = thread_create_event();
+            dev->thread_in = thread_create(char_stdio_console_thread, dev);
         } else {
             /* Redirected (or MSYS2), use file I/O. */
             char_stdio_log(dev->log, "Input GetConsoleMode failed (%08X)\n", GetLastError());
