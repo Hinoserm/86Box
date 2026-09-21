@@ -3016,6 +3016,53 @@ aic_seeprom_build(const aic7880_t *dev, uint16_t *nvr)
 
 /* ---- the register window ------------------------------------------------ */
 
+/* Where the configuration utility put the option ROM. The window size
+   follows the image, since the family shipped 16, 32 and 64 KB parts. */
+static void
+aic_eisa_bios(aic7880_t *dev, const device_t *info)
+{
+    const char *fn = device_get_config_string("bios_fn");
+    uint32_t    base;
+    uint32_t    size;
+    FILE       *fp;
+
+    if (!device_get_config_int("bios") || (fn == NULL) || (fn[0] == '\0'))
+        return;
+
+    fp = rom_fopen((char *) fn, "rb");
+    if (fp == NULL) {
+        aic_log("aic7770: could not read %s\n", fn);
+        return;
+    }
+    fseek(fp, 0, SEEK_END);
+    size = (uint32_t) ftell(fp);
+    fclose(fp);
+
+    if (size <= 0x4000)
+        size = 0x4000;
+    else if (size <= 0x8000)
+        size = 0x8000;
+    else
+        size = 0x10000;
+
+    base = 0xc0000 + (((uint32_t) device_get_config_int("bios_addr") & 0x07) << 14);
+
+    if (rom_init(&dev->bios, (char *) fn, base, size, size - 1, 0,
+                 MEM_MAPPING_EXTERNAL) < 0) {
+        aic_log("aic7770: could not map %s\n", fn);
+        return;
+    }
+
+    dev->has_bios = 1;
+    dev->rom_size = size;
+
+    /* Say the BIOS is there, so the driver takes the adapter's identifier
+       from the configuration chip instead of falling back to seven. */
+    dev->eisa_conf[HA_274_BIOSCTRL - SCSICONF] = 0x10;
+
+    aic_log("aic7770: BIOS %s, %u KB at %05x\n", fn, size >> 10, base);
+}
+
 /* The EISA part answers in the last of its slot's four ranges, at zC00,
    with the register number in the low byte. The four bytes at zC80 are the
    product identifier and the bus serves those itself. */
@@ -3413,10 +3460,13 @@ aic_init(const device_t *info)
         dev->eisa_conf[INTDEF - SCSICONF]     = irq & 0x0f;
         dev->eisa_conf[HOSTCONF - SCSICONF]   = 0x2d;
         dev->eisa_conf[0x5e - SCSICONF]       = 0x00;
-        dev->eisa_conf[HA_274_BIOSCTRL - SCSICONF] = 0x10;
+        /* No BIOS unless one is given; aic_eisa_bios() says otherwise. */
+        dev->eisa_conf[HA_274_BIOSCTRL - SCSICONF] = 0x30;
         dev->eisa_global                           = 0x01;
 
         dev->irq = irq;
+
+        aic_eisa_bios(dev, info);
 
         eisa_make_id(id, "ADP", 0x7771, 0);
         if (!eisa_add(dev->eisa_slot, id, aic_eisa_read, aic_eisa_write,
@@ -3512,6 +3562,49 @@ aic_close(void *priv)
 
 static const device_config_t aic7770_config[] = {
     // clang-format off
+    {
+        .name           = "bios",
+        .description    = "Enable BIOS",
+        .type           = CONFIG_BINARY,
+        .default_string = NULL,
+        .default_int    = 0,
+        .file_filter    = NULL,
+        .spinner        = { 0 },
+        .selection      = { { 0 } },
+        .bios           = { { 0 } }
+    },
+    {
+        .name           = "bios_fn",
+        .description    = "BIOS image",
+        .type           = CONFIG_FNAME,
+        .default_string = "",
+        .default_int    = 0,
+        .file_filter    = "BIOS images (*.bin *.rom)|*.bin;*.rom|All files (*.*)|*.*",
+        .spinner        = { 0 },
+        .selection      = { { 0 } },
+        .bios           = { { 0 } }
+    },
+    {
+        .name           = "bios_addr",
+        .description    = "BIOS address",
+        .type           = CONFIG_SELECTION,
+        .default_string = NULL,
+        .default_int    = 4,
+        .file_filter    = NULL,
+        .spinner        = { 0 },
+        .selection      = {
+            { .description = "C0000H", .value = 0 },
+            { .description = "C4000H", .value = 1 },
+            { .description = "C8000H", .value = 2 },
+            { .description = "CC000H", .value = 3 },
+            { .description = "D0000H", .value = 4 },
+            { .description = "D4000H", .value = 5 },
+            { .description = "D8000H", .value = 6 },
+            { .description = "DC000H", .value = 7 },
+            { .description = ""                   }
+        },
+        .bios           = { { 0 } }
+    },
     {
         .name           = "slot",
         .description    = "EISA slot",

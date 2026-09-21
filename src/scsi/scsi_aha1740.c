@@ -655,9 +655,14 @@ aha1740_write(uint16_t port, uint8_t val, void *priv)
 static void
 aha1740_reset(void *priv)
 {
-    aha1740_t *dev = (aha1740_t *) priv;
+    aha1740_t *dev   = (aha1740_t *) priv;
+    uint8_t    biosad = dev->regs[AHA_BIOSADR];
 
     memset(dev->regs, 0, sizeof(dev->regs));
+
+    /* Where the BIOS answers is part of the board's configuration, not
+       its running state: a reset does not make the option ROM vanish. */
+    dev->regs[AHA_BIOSADR] = biosad;
 
     /* Enhanced mode, because that is what the configuration utility
        writes and what every EISA driver expects to find. */
@@ -674,6 +679,7 @@ aha1740_reset(void *priv)
     dev->irq      = aha1740_intab[dev->regs[AHA_INTDEF] & 0x07];
     dev->id       = 7;
 
+    aha1740_bios_remap(dev);
     aha1740_reset_card(dev);
 }
 
