@@ -1367,7 +1367,13 @@ aic_scsi_reset_bus(aic7880_t *dev)
     for (uint8_t i = 0; i < (dev->wide ? 16 : 8); i++)
         scsi_device_reset(&scsi_devices[dev->bus][i]);
 
-    aic_set_sstat1(dev, SCSIRSTI);
+    /* SCSIRSTI is reset *in*: a reset arriving from somebody else. The
+       part does not report the one it is driving itself, and it cannot
+       afford to -- an interrupt stops the sequencer, and the sequencer is
+       what times the reset and finishes it. The card's own BIOS proves
+       the point: it enables ENSCSIRST, then asserts SCSIRSTO, then starts
+       the sequencer and waits for it to answer. Nothing else on this bus
+       can drive the line, so the status stays clear. */
     aic_bus_changed(dev);
 }
 
