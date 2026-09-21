@@ -502,6 +502,7 @@ typedef struct aic_cmd_t {
     double   delay;    /* how long the device takes over this command, in microseconds */
     double   ready_at; /* when a disconnected target has its answer and may come back */
     uint8_t  delayed;  /* the wait for the medium has been served */
+    uint8_t  bus;      /* the channel it was selected on */
 } aic_cmd_t;
 
 #define AIC_CMDS 64
@@ -524,6 +525,7 @@ typedef struct aic7xxx_t {
     uint8_t       bus;
     uint8_t       wide;
     uint8_t       twin;  /* the board is wired for two SCSI buses */
+    uint8_t       bus_b; /* and the second one it is wired to */
     uint8_t       eisa_id[4];
     const aic_chip_t *chip;
     uint8_t       board; /* info->local */
@@ -660,6 +662,16 @@ typedef struct aic7xxx_t {
     pc_timer_t sel_timer;
     pc_timer_t tgt_timer;
 } aic7xxx_t;
+
+/* Channel A and channel B are two separate SCSI buses sharing one register
+   file; SELBUSB says which of them the file -- and so the SCSI cell -- is
+   switched to. A board wired for one channel has nothing behind the other,
+   and selecting over there finds no-one. */
+static uint8_t
+aic_cur_bus(const aic7xxx_t *dev)
+{
+    return ((dev->sblkctl & SELBUSB) && dev->twin) ? dev->bus_b : dev->bus;
+}
 
 static void aic_update_irq(aic7xxx_t *dev);
 static void aic_seq_kick(aic7xxx_t *dev);
@@ -946,7 +958,7 @@ aic_msgin(aic7xxx_t *dev, const uint8_t *msg, int len, uint8_t after)
 static void
 aic_cmd_execute(aic7xxx_t *dev, aic_cmd_t *c)
 {
-    scsi_device_t *sd = &scsi_devices[dev->bus][c->id];
+    scsi_device_t *sd = &scsi_devices[c->bus][c->id];
     double         p;
 
     c->executed = 1;
@@ -985,7 +997,7 @@ aic_cmd_execute(aic7xxx_t *dev, aic_cmd_t *c)
 static void
 aic_cmd_finish_out(aic7xxx_t *dev, aic_cmd_t *c)
 {
-    scsi_device_t *sd = &scsi_devices[dev->bus][c->id];
+    scsi_device_t *sd = &scsi_devices[c->bus][c->id];
 
     if (c->data_in || (c->data_len == 0) || (c->data == NULL))
         return;
@@ -1409,12 +1421,7 @@ aic_select_done(void *priv)
        half of the addresses is not aliased down onto the bottom half --
        there is simply nothing there, and selecting it runs out. */
     id = (dev->scsiid >> 4) & 0x0f;
-    sd = (!dev->wide && (id > 7)) ? NULL : &scsi_devices[dev->bus][id];
-    /* Channel B is a second connector, and a board wired for one has
-       nothing on it. Selecting over there finds no-one and times out,
-       which is how the firmware learns there is nothing to scan. */
-    if ((dev->sblkctl & SELBUSB) && !dev->twin)
-        sd = NULL;
+    sd = (!dev->wide && (id > 7)) ? NULL : &scsi_devices[aic_cur_bus(dev)][id];
 
     /* Nobody there, and the selection timer not running: the chip goes on
        selecting for ever. CHIPRST leaves ENSTIMER clear, so a driver that
@@ -1447,7 +1454,8 @@ aic_select_done(void *priv)
         aic_bus_changed(dev);
         return;
     }
-    c->id = id;
+    c->id  = id;
+    c->bus = aic_cur_bus(dev);
 
     dev->cur       = c;
     dev->bus_state = BUS_BUSY;
@@ -1478,10 +1486,6 @@ aic_reselect_try(aic7xxx_t *dev)
     if ((dev->bus_state != BUS_FREE) || dev->selecting)
         return;
     if (!(dev->scsiseq & ENRSELI))
-        return;
-    /* Our targets are all on channel A; nothing reconnects while the
-       register file is switched to the other channel. */
-    if ((dev->sblkctl & SELBUSB) && !dev->twin)
         return;
     c = aic_find_reselect(dev);
     if (c == NULL)
@@ -1531,7 +1535,7 @@ aic_scsi_reset_bus(aic7xxx_t *dev)
     timer_stop(&dev->tgt_timer);
 
     for (uint8_t i = 0; i < (dev->wide ? 16 : 8); i++)
-        scsi_device_reset(&scsi_devices[dev->bus][i]);
+        scsi_device_reset(&scsi_devices[aic_cur_bus(dev)][i]);
 
     if (dev->chip->own_reset_seen)
         aic_set_sstat1(dev, SCSIRSTI);
@@ -3859,14 +3863,25 @@ aic_init(const device_t *info)
        same chip for two buses or for one wide one, and on the AIC-7770
        those are exclusive: the wide connection takes channel B's data
        lines for the top half of channel A. */
-    dev->twin  = 0;
+    /* Two connectors. The data book's strap table gives SBLKCTL 08h for
+       "DualBusses", 02h for one wide channel and 00h for a single narrow
+       one, and the configuration utility writes a SCSICONF for each
+       channel, so a board whose CFG declares both is wired for both. */
+    dev->twin  = (dev->board == BOARD_2740);
 
     dev->eisa  = (dev->board == BOARD_2740);
     /* Which part this board is built on, before anything asks. */
     dev->chip  = dev->eisa ? &aic_chip_7770 : &aic_chip_788x;
     dev->bus   = scsi_get_bus();
+    /* Channel B is a bus of its own, and the configuration utility gives it
+       its own SCSICONF: !ADP7771.CFG declares IOPORT(3) as a word, so the
+       firmware writes 5Ah and 5Bh together and the board comes up with both
+       channels configured. */
+    dev->bus_b = dev->twin ? scsi_get_bus() : dev->bus;
 
     scsi_bus_set_speed(dev->bus, 20000000.0);
+    if (dev->twin)
+        scsi_bus_set_speed(dev->bus_b, 20000000.0);
 
     /* The on-board part answers as the bare chip; the cards carry the
        adapter's own ID, which is how a driver tells them apart and how
