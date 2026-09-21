@@ -120,6 +120,32 @@ typedef struct pceb_t {
 static esc_t *esc_inst = NULL;
 
 /* ------------------------------------------------------------------ */
+/* The fail-safe timer                                                 */
+/* ------------------------------------------------------------------ */
+
+/* Timer 2, counter 0 is the fail-safe timer: software is meant to keep
+   reloading it, and if it ever runs out the board takes that as the
+   machine having wedged and raises an NMI. Bit 2 of the extended NMI
+   control register is what lets it through, and the data book is explicit
+   that the status bit only sets when it is enabled. */
+static void
+esc_fail_safe_timer(int new_out, int old_out, UNUSED(void *priv))
+{
+    esc_t *dev = esc_inst;
+
+    if ((dev == NULL) || !new_out || old_out)
+        return;
+
+    if (!(dev->nmi_esc & 0x04))
+        return;
+
+    esc_log("ESC: the fail-safe timer ran out\n");
+    dev->nmi_esc |= 0x80;
+    nmi           = 1;
+    nmi_auto_clear = 1;
+}
+
+/* ------------------------------------------------------------------ */
 /* PCI interrupt steering                                              */
 /* ------------------------------------------------------------------ */
 
@@ -849,6 +875,11 @@ esc_init(UNUSED(const device_t *info))
     /* A second timer: counter 0 is the fail-safe timer that can raise
        NMI, counter 2 drives CPU speed control. */
     device_add(&i8254_sec_device);
+
+    /* Timer 2's first counter is the fail-safe timer, and its output is
+       an NMI source rather than an interrupt. */
+    if (pit_devs[1].data != NULL)
+        pit_devs[1].set_out_func(pit_devs[1].data, 0, esc_fail_safe_timer);
 
     dev->port_92 = device_add(&port_92_pci_device);
 
