@@ -158,6 +158,16 @@
        </property>
       </widget>
      </item>
+     <item row="5" column="0" colspan="3">
+      <widget class="QCheckBox" name="checkBoxKeyboardPipe">
+       <property name="text">
+        <string>Named pipe keyboard input</string>
+       </property>
+       <property name="toolTip">
+        <string>Create a keyboard.pipe FIFO next to this machine's configuration; text written to it is typed into the machine.</string>
+       </property>
+      </widget>
+     </item>
      <item row="4" column="0" colspan="3">
       <layout class="QHBoxLayout" name="joystickButtonsLayout">
        <item>

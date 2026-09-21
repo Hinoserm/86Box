@@ -179,8 +179,8 @@ if(WIN32 AND NOT QT)
 endif()
 
 if(WIN32 AND GDBSTUB)
-    # Force console subsystem when building with GDBSTUB
-    set(CMAKE_WIN32_EXECUTABLE OFF CACHE BOOL "Build a Windows GUI executable" FORCE)
+    # Keep the GUI subsystem: the stub does not need a console window.
+    # set(CMAKE_WIN32_EXECUTABLE OFF CACHE BOOL "Build a Windows GUI executable" FORCE)
 endif()
 
 if(GDBSTUB)

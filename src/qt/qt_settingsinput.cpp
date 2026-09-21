@@ -70,6 +70,8 @@ SettingsInput::SettingsInput(QWidget *parent)
     tabletType   = tablet_type;
     joystickType = joystick_type[0];
 
+    ui->checkBoxKeyboardPipe->setChecked(keyboard_pipe > 0);
+
     onCurrentMachineChanged(machine);
 }
 
@@ -118,6 +120,7 @@ SettingsInput::changed()
 
     has_changed |= (keyboard_type != ui->comboBoxKeyboard->currentData().toInt());
     has_changed |= kbd_config_changed;
+    has_changed |= (!!keyboard_pipe != ui->checkBoxKeyboardPipe->isChecked());
     has_changed |= (mouse_type    != ui->comboBoxMouse->currentData().toInt());
     has_changed |= mouse_config_changed;
     has_changed |= (tablet_type   != ui->comboBoxTablet->currentData().toInt());
@@ -143,6 +146,7 @@ SettingsInput::save(int soft)
         return;
 
     keyboard_type = ui->comboBoxKeyboard->currentData().toInt();
+    keyboard_pipe = ui->checkBoxKeyboardPipe->isChecked() ? 1 : 0;
     mouse_type    = ui->comboBoxMouse->currentData().toInt();
     tablet_type   = ui->comboBoxTablet->currentData().toInt();
 

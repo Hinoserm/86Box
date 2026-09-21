@@ -41,6 +41,7 @@ typedef struct keyboard_t {
 } keyboard_t;
 
 int          keyboard_type    = 0;
+int          keyboard_pipe    = 0;
 
 static int   override_capture = 0;
 

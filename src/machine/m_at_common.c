@@ -74,7 +74,8 @@ machine_at_common_init(const machine_t *model)
         device_add(&port_6x_device);
 
     /* A way in for keystrokes that does not need a window to focus. */
-    device_add(&kbd_pipe_device);
+    if (keyboard_pipe)
+        device_add(&kbd_pipe_device);
 
     standalone_gameport_type = &gameport_device;
 }
