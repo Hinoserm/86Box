@@ -806,11 +806,34 @@ esc_reset_hard(esc_t *dev)
 
     /* B-0 stepping. The EB is 02h. */
     dev->regs[0x08] = 0x03;
+    /* MS, mode select. Bit 5, the configuration RAM page address
+       generation, is a one out of reset: "If this bit is set to 1,
+       accesses to the configuration RAM space will generate the RAM page
+       address ... The default for this bit is 1." Bit 6, which is what
+       makes the pins PIRQs rather than MREQs, is not. */
+    dev->regs[0x40] = 0x20;
+    /* BIOSCSA, BIOS chip select A. */
+    dev->regs[0x42] = 0x10;
+    /* CLKDIV, the EISA clock divisor: xx001000b. */
+    dev->regs[0x4d] = 0x08;
+    /* PCSA, peripheral chip select A: x0000111b. */
+    dev->regs[0x4e] = 0x07;
+    /* PCSB, peripheral chip select B. CRAM decode and Port 92 decode are
+       both enabled out of reset, and the parallel port is decoded at
+       LPT1 -- CFh. Coming up at zero told anything that reads it back
+       that the configuration RAM is not decoded at all. */
+    dev->regs[0x4f] = 0xcf;
     /* The scatter-gather registers default to the 04xx page. */
     dev->regs[0x57] = 0x04;
     /* Every PCI interrupt starts unrouted. */
     dev->regs[0x60] = dev->regs[0x61] = 0x80;
     dev->regs[0x62] = dev->regs[0x63] = 0x80;
+    /* GPCSH[2:0], the general purpose chip select high addresses. */
+    dev->regs[0x65] = dev->regs[0x69] = dev->regs[0x6d] = 0xc0;
+    /* SMICNTL, SMI control. */
+    dev->regs[0xa0] = 0x08;
+    /* FTMR, the fast off timer. */
+    dev->regs[0xa8] = 0x0f;
 
     dev->nmi_esc  = 0x00;
     dev->last_mst = 0x00;
@@ -1062,21 +1085,44 @@ pceb_reset_hard(pceb_t *dev)
     dev->regs[0x01] = 0x80;
     dev->regs[0x02] = 0x82; /* 82375EB/SB */
     dev->regs[0x03] = 0x04;
-    dev->regs[0x04] = 0x07; /* I/O, memory and bus mastering all on */
-    dev->regs[0x06] = 0x80;
-    dev->regs[0x07] = 0x02; /* medium DEVSEL */
+    /* PCICMD, 0007h: I/O space, memory space and bus mastering are all
+       enabled out of reset on this part. */
+    dev->regs[0x04] = 0x07;
+    dev->regs[0x05] = 0x00;
+    /* PCISTS, 0200h: medium DEVSEL timing and nothing else. */
+    dev->regs[0x06] = 0x00;
+    dev->regs[0x07] = 0x02;
     dev->regs[0x08] = 0x04; /* revision */
     dev->regs[0x09] = 0x00;
-    dev->regs[0x0a] = 0x00; /* bridge, EISA */
-    dev->regs[0x0b] = 0x06;
+    /* 09h-0Ch are Reserved on this part -- the whole of what later became
+       the class code. The 82375EB is a PCI 1.0 device and its register
+       table has no class code in it at all, so those bytes read zero.
+       Software knows what this is from the vendor and device identifiers,
+       8086h and 0482h, and nothing else. */
+    dev->regs[0x0a] = 0x00;
+    dev->regs[0x0b] = 0x00;
 
-    dev->regs[0x40] = 0x00;
-    dev->regs[0x41] = 0x00;
-    dev->regs[0x42] = 0x00;
-    dev->regs[0x43] = 0x00;
-    dev->regs[0x44] = 0x00;
-    dev->regs[0x47] = 0x00;
-    dev->regs[0x4c] = 0x00;
+    dev->regs[0x40] = 0x00; /* PCICON */
+    dev->regs[0x41] = 0x80; /* ARBCON */
+    dev->regs[0x42] = 0x04; /* ARBPRI */
+    dev->regs[0x43] = 0x00; /* ARBPRIX */
+    dev->regs[0x44] = 0x00; /* MCSCON */
+    dev->regs[0x45] = 0x10; /* MCSBOH, the bottom of the hole */
+    dev->regs[0x46] = 0x0f; /* MCSTOH, the top of it */
+    dev->regs[0x47] = 0x00; /* MCSTOM */
+    dev->regs[0x48] = 0x01; /* EADC1, 0001h */
+    dev->regs[0x49] = 0x00;
+    dev->regs[0x4c] = 0x56; /* IORTC, the ISA I/O recovery time */
+    /* MEMREGN[4:1] come up as 0000FFFFh and IOREGN[4:1] as 0000FFFCh:
+       a base of zero and a size field of all ones, which is how a region
+       that has not been programmed reads. */
+    for (uint8_t i = 0; i < 4; i++) {
+        dev->regs[0x60 + (i * 4)] = 0xff;
+        dev->regs[0x61 + (i * 4)] = 0xff;
+        dev->regs[0x70 + (i * 4)] = 0xfc;
+        dev->regs[0x71 + (i * 4)] = 0xff;
+    }
+    dev->regs[0x84] = 0x7f; /* ELTCR, the EISA latency timer */
 }
 
 static void
