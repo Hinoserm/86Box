@@ -52,6 +52,7 @@
 #include <86box/dma.h>
 #include <86box/pic.h>
 #include <86box/pit.h>
+#include <86box/apm.h>
 #include <86box/nmi.h>
 #include <86box/port_92.h>
 #include <86box/eisa.h>
@@ -86,6 +87,8 @@ typedef struct esc_t {
     uint8_t nmi_esc;  /* 0461h, extended NMI status and control */
     uint8_t last_mst; /* 0464h, last EISA bus master granted */
 
+    void   *apm;
+
     uint8_t board_id[4];
     uint8_t embedded_id[4]; /* a device soldered to the board */
 
@@ -114,9 +117,129 @@ typedef struct pceb_t {
     uint8_t pci_slot;
     uint8_t irq_state;
     uint8_t regs[256];
+
+    /* The BIOS timer, the one internal resource this half maps into PCI
+       I/O space. */
+    uint16_t   btmr_base;
+    pc_timer_t bios_timer;
 } pceb_t;
 
+/* The timer is clocked from BCLK divided by eight -- 8.33 MHz over eight
+   is 1.04 MHz, so a count is a shade under a microsecond. */
+#define PCEB_BIOS_TICK_US (8.0 / 8.33)
+
 static esc_t *esc_inst = NULL;
+
+/* ------------------------------------------------------------------ */
+/* The BIOS timer                                                      */
+/* ------------------------------------------------------------------ */
+
+/* "After data is written into BIOS Timer Register the BIOS timer starts
+   decrementing until it reaches zero. It freezes at zero until the new
+   count value is written." Sixteen bits of count; the top half of the
+   dword is reserved and reads zero. */
+static uint16_t
+pceb_bios_timer_count(pceb_t *dev)
+{
+    double left = timer_get_remaining_us(&dev->bios_timer);
+
+    if (left <= 0.0)
+        return 0;
+    return (uint16_t) (left / PCEB_BIOS_TICK_US);
+}
+
+static void
+pceb_bios_timer_set(pceb_t *dev, uint16_t count)
+{
+    if (count == 0)
+        timer_disable(&dev->bios_timer);
+    else
+        timer_set_delay_u64(&dev->bios_timer,
+                            (uint64_t) (((double) count) * PCEB_BIOS_TICK_US *
+                                        ((double) TIMER_USEC)));
+}
+
+static void
+pceb_bios_timer_tick(UNUSED(void *priv))
+{
+    /* Nothing to do when it runs out: it simply reads zero from then on. */
+}
+
+static uint8_t
+pceb_btmr_readb(uint16_t port, void *priv)
+{
+    pceb_t  *dev = (pceb_t *) priv;
+    uint32_t v   = pceb_bios_timer_count(dev);
+
+    return (uint8_t) (v >> (((port - dev->btmr_base) & 3) * 8));
+}
+
+static uint16_t
+pceb_btmr_readw(uint16_t port, void *priv)
+{
+    pceb_t *dev = (pceb_t *) priv;
+
+    return ((port - dev->btmr_base) & 2) ? 0x0000
+                                         : pceb_bios_timer_count(dev);
+}
+
+static uint32_t
+pceb_btmr_readl(UNUSED(uint16_t port), void *priv)
+{
+    return pceb_bios_timer_count((pceb_t *) priv);
+}
+
+static void
+pceb_btmr_writeb(uint16_t port, uint8_t val, void *priv)
+{
+    pceb_t  *dev = (pceb_t *) priv;
+    uint16_t c   = pceb_bios_timer_count(dev);
+
+    if (((port - dev->btmr_base) & 3) >= 2)
+        return; /* the top half is reserved */
+    if ((port - dev->btmr_base) & 1)
+        c = (uint16_t) ((c & 0x00ff) | (val << 8));
+    else
+        c = (uint16_t) ((c & 0xff00) | val);
+    pceb_bios_timer_set(dev, c);
+}
+
+static void
+pceb_btmr_writew(uint16_t port, uint16_t val, void *priv)
+{
+    pceb_t *dev = (pceb_t *) priv;
+
+    if (!((port - dev->btmr_base) & 2))
+        pceb_bios_timer_set(dev, val);
+}
+
+static void
+pceb_btmr_writel(UNUSED(uint16_t port), uint32_t val, void *priv)
+{
+    pceb_bios_timer_set((pceb_t *) priv, (uint16_t) val);
+}
+
+/* "Bit 0 of BTMR must be 1 to enable access"; the rest of it is a Dword
+   aligned address in PCI I/O space. The decode is off out of reset. */
+static void
+pceb_bios_timer_remap(pceb_t *dev)
+{
+    uint16_t btmr = (uint16_t) (dev->regs[0x80] | (dev->regs[0x81] << 8));
+
+    if (dev->btmr_base != 0x0000) {
+        io_removehandler(dev->btmr_base, 0x0004, pceb_btmr_readb,
+                         pceb_btmr_readw, pceb_btmr_readl, pceb_btmr_writeb,
+                         pceb_btmr_writew, pceb_btmr_writel, dev);
+        dev->btmr_base = 0x0000;
+    }
+
+    if (btmr & 0x0001) {
+        dev->btmr_base = btmr & 0xfffc;
+        io_sethandler(dev->btmr_base, 0x0004, pceb_btmr_readb,
+                      pceb_btmr_readw, pceb_btmr_readl, pceb_btmr_writeb,
+                      pceb_btmr_writew, pceb_btmr_writel, dev);
+    }
+}
 
 /* ------------------------------------------------------------------ */
 /* The fail-safe timer                                                 */
@@ -900,6 +1023,13 @@ esc_init(UNUSED(const device_t *info))
     if (pit_devs[1].data != NULL)
         pit_devs[1].set_out_func(pit_devs[1].data, 0, esc_fail_safe_timer);
 
+    /* The 82374SB's two power management ports, APMC at 0B2h and APMS at
+       0B3h. The data book puts them in normal I/O space rather than in
+       the configuration registers with the rest of the power management,
+       and they are eight bit accesses only: "This register passes data
+       (APM Commands) between the OS and the SMI handler." */
+    dev->apm = device_add(&apm_pci_device);
+
     dev->port_92 = device_add(&port_92_pci_device);
 
     io_sethandler(ESC_CONF_INDEX, 0x0002, esc_read, NULL, NULL, esc_write,
@@ -1052,6 +1182,7 @@ pceb_write(int func, int addr, UNUSED(int len), uint8_t val, void *priv)
         case 0x80: /* BTMR, the BIOS timer's base address */
         case 0x81:
             dev->regs[addr] = val;
+            pceb_bios_timer_remap(dev);
             break;
 
         case 0x84: /* ELTCR */
@@ -1123,6 +1254,11 @@ pceb_reset_hard(pceb_t *dev)
         dev->regs[0x71 + (i * 4)] = 0xff;
     }
     dev->regs[0x84] = 0x7f; /* ELTCR, the EISA latency timer */
+    /* BTMR, 0078h. Bit 0 is the enable and it is clear, which is what the
+       book means by the BIOS timer's decode being off after reset. */
+    dev->regs[0x80] = 0x78;
+    dev->regs[0x81] = 0x00;
+    pceb_bios_timer_remap(dev);
 }
 
 static void
@@ -1143,6 +1279,8 @@ pceb_init(UNUSED(const device_t *info))
     pceb_t *dev = (pceb_t *) calloc(1, sizeof(pceb_t));
 
     pceb_reset_hard(dev);
+
+    timer_add(&dev->bios_timer, pceb_bios_timer_tick, dev, 0);
 
     pci_add_card(PCI_ADD_SOUTHBRIDGE, pceb_read, pceb_write, dev, &dev->pci_slot);
 
