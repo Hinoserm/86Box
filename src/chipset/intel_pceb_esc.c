@@ -415,48 +415,54 @@ esc_cram_generate(esc_t *dev)
     memcpy(&c[0x2f], dev->embedded_id, 4);
     c[0x33] = 0x50;
 
-    /* Then a configuration record for every slot that has a board in it,
-       laid out the way the firmware's own "write slot configuration" lays
-       them out: a word of length plus four, a word of index, and then the
-       twelve bytes the EISA services hand over -- slot information, the
-       revision, a checksum, how many functions there are, and the four
-       identifier bytes. The records grow upward from block+FCh, which is
-       where block+0Ah points and what block+06h counts down from. */
+    /* A configuration record for the board and for every slot with a
+       board in it. The table of offsets at block+0Eh is indexed by the
+       slot number itself -- the firmware's "read slot configuration"
+       takes the slot in CL and goes straight to the entry -- and it
+       refuses any slot not below the count at block+0Ch. So slot zero,
+       the board, comes first, and the count runs to the last one filled.
+
+       Each record is eight bytes of header, being its length, the slot
+       it describes and the four identifier bytes, followed by a chain of
+       function blocks each starting with its own length. A zero length
+       ends the chain, which is what a board with nothing to allocate
+       looks like. They grow upward from block+FCh, which is where
+       block+0Ah points and what block+06h counts down from. */
     {
         uint16_t at    = ESC_CRAM_RECS;
         uint16_t free  = 0x1eb4;
         uint8_t  count = 0;
 
-        for (uint8_t slot = 1; slot <= EISA_MAX_SLOTS; slot++) {
+        for (uint8_t slot = 0; slot <= EISA_MAX_SLOTS; slot++) {
             uint8_t *r;
+            uint8_t  id[4];
 
-            if (!eisa_slot_occupied(slot) || (free < ESC_CRAM_RECLEN + 4))
+            if (slot == 0)
+                memcpy(id, dev->board_id, 4);
+            else if (eisa_slot_occupied(slot)) {
+                for (uint8_t i = 0; i < 4; i++)
+                    id[i] = eisa_slot_id(slot, i);
+            } else
                 continue;
 
-            r = &c[ESC_CRAM_BASE + at];
+            if (free < (ESC_CRAM_RECLEN + 4))
+                break;
+
+            r    = &c[ESC_CRAM_BASE + at];
             r[0] = ESC_CRAM_RECLEN + 4;
             r[1] = 0x00;
-            r[2] = count;
+            r[2] = slot;
             r[3] = 0x00;
-
-            r[4] = slot;  /* which slot this describes */
-            r[5] = 0x01;  /* the revision of the record */
-            r[6] = 0x00;
-            r[7] = 0x00;  /* its own checksum, filled in below */
+            memcpy(&r[4], id, 4);
             r[8] = 0x00;
-            r[9] = 0x00;  /* no function records follow */
-            r[10] = 0x00;
-            for (uint8_t i = 0; i < 4; i++)
-                r[11 + i] = eisa_slot_id(slot, i);
+            r[9] = 0x00;
 
-            /* The pointer table, the count, the next free byte and what is
-               left of the room. */
-            c[ESC_CRAM_BASE + 0x0e + (count * 2)]     = (uint8_t) (at & 0xff);
-            c[ESC_CRAM_BASE + 0x0e + (count * 2) + 1] = (uint8_t) (at >> 8);
+            c[ESC_CRAM_BASE + 0x0e + (slot * 2)]     = (uint8_t) (at & 0xff);
+            c[ESC_CRAM_BASE + 0x0e + (slot * 2) + 1] = (uint8_t) (at >> 8);
 
-            at   = (uint16_t) (at + ESC_CRAM_RECLEN + 4);
-            free = (uint16_t) (free - (ESC_CRAM_RECLEN + 4));
-            count++;
+            at    = (uint16_t) (at + ESC_CRAM_RECLEN + 4);
+            free  = (uint16_t) (free - (ESC_CRAM_RECLEN + 4));
+            count = (uint8_t) (slot + 1);
         }
 
         c[ESC_CRAM_BASE + 0x0c] = count;
