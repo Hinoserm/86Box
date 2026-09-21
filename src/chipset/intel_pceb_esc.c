@@ -48,6 +48,7 @@
 #include <86box/io.h>
 #include <86box/mem.h>
 #include <86box/timer.h>
+#include "cpu.h"
 #include <86box/pci.h>
 #include <86box/dma.h>
 #include <86box/pic.h>
@@ -84,11 +85,13 @@ typedef struct esc_t {
     uint8_t unlocked; /* 0Fh has been written to the ID register */
     uint8_t regs[256];
 
+    pc_timer_t fast_off;  /* the Fast Off timer, one minute a tick */
     uint8_t nmi_esc;  /* 0461h, extended NMI status and control */
     uint8_t serr_nmi; /* SERR# is what is holding NMI up */
     uint8_t last_mst; /* 0464h, last EISA bus master granted */
 
     void   *apm;
+    uint8_t fast_off_count; /* what is left of FTMR's minutes */
     uint8_t cram_decoded;
     uint8_t port_92_decoded;
 
@@ -254,6 +257,82 @@ pceb_bios_timer_remap(pceb_t *dev)
    machine having wedged and raises an NMI. Bit 2 of the extended NMI
    control register is what lets it through, and the data book is explicit
    that the status bit only sets when it is enabled. */
+/* One minute a tick: "The count time interval is one minute." */
+#define ESC_FAST_OFF_TICK (60.0 * 1000000.0)
+
+/* An SMI source firing. SMIEN says whether the event is one the part
+   watches, SMIREQ records it, and SMICNTL bit 0 decides only whether the
+   pin moves: it "does not effect the detection/recording of SMI events
+   (i.e., This bit does not effect the SMI status bits in the SMIREQ
+   Register). Thus, SMI conditions can be pending when this bit is set to
+   1."
+
+   One indication per active event, which the book spells out for the
+   interrupt sources and applies to all of them: "If the SMI event is
+   still active when the corresponding SMIREQ bit is set to 0, the ESC
+   does not set the status bit back to a 1." */
+static void
+esc_smi_event(esc_t *dev, uint8_t bit)
+{
+    const uint8_t mask = (uint8_t) (1 << bit);
+
+    if (!(dev->regs[0xa2] & mask) || (dev->regs[0xaa] & mask))
+        return;
+
+    esc_log("ESC: SMI source %u\n", bit);
+    dev->regs[0xaa] |= mask;
+
+    if (dev->regs[0xa0] & 0x01)
+        smi_raise();
+}
+
+/* Bit 3 of SMICNTL stops the count -- "When this bit is 1, the Fast Off
+   timer stops counting. This prevents time-outs from occurring while
+   executing SMM code" -- and it comes up set, the register defaulting to
+   08h. */
+static void
+esc_fast_off_remap(esc_t *dev)
+{
+    if (dev->regs[0xa0] & 0x08) {
+        timer_stop(&dev->fast_off);
+        return;
+    }
+    if (!timer_is_enabled(&dev->fast_off))
+        timer_on_auto(&dev->fast_off, ESC_FAST_OFF_TICK);
+}
+
+/* "When the Fast Off Timer reaches 00h, an SMI is generated and the timer
+   is re-load with the value programmed into this register." The register
+   holds the starting count; this counts it down a minute at a time. */
+static void
+esc_fast_off_tick(void *priv)
+{
+    esc_t *dev = (esc_t *) priv;
+
+    if (dev->regs[0xa0] & 0x08)
+        return;
+
+    if (dev->fast_off_count > 0)
+        dev->fast_off_count--;
+
+    if (dev->fast_off_count == 0) {
+        esc_smi_event(dev, 5);
+        dev->fast_off_count = dev->regs[0xa8];
+    }
+
+    timer_on_auto(&dev->fast_off, ESC_FAST_OFF_TICK);
+}
+
+/* A write to APMC at 0B2h. The power management device beside us keeps
+   the byte; what the ESC adds is that the write is an SMI source, which
+   is SMIEN bit 7: "This bit enables SMI for writes to the APMC Register."
+   Its own do_smi is left clear so that the raising is ours to gate. */
+static void
+esc_apmc_write(UNUSED(uint16_t port), UNUSED(uint8_t val), void *priv)
+{
+    esc_smi_event((esc_t *) priv, 7);
+}
+
 static void
 esc_fail_safe_timer(int new_out, int old_out, UNUSED(void *priv))
 {
@@ -910,6 +989,12 @@ esc_conf_write(esc_t *dev, uint8_t index, uint8_t val)
 
         case 0xa0: /* SMICNTL */
             dev->regs[0xa0] = val & 0x0f;
+            /* Bit 3 starts and stops the Fast Off timer. */
+            esc_fast_off_remap(dev);
+            /* And bit 0 is only the pin: "If an SMI is pending when this
+               bit is set to 1, the SMI# signal is asserted." */
+            if ((val & 0x01) && dev->regs[0xaa])
+                smi_raise();
             break;
         case 0xa2: /* SMIEN */
         case 0xa3:
@@ -922,11 +1007,22 @@ esc_conf_write(esc_t *dev, uint8_t index, uint8_t val)
             dev->regs[index] = val;
             break;
         case 0xa8: /* FTMR */
-            dev->regs[0xa8] = val;
+            /* "A read from the FTMR Register returns the value last
+               written", and the count restarts from it. The book asks
+               for the timer to be stopped first and says not to write
+               00h; neither is enforced here, and a zero simply means the
+               reload never leaves zero. */
+            dev->regs[0xa8]     = val;
+            dev->fast_off_count = val;
             break;
-        case 0xaa: /* SMIREQ, write one to clear */
+        case 0xaa: /* SMIREQ, status */
         case 0xab:
-            dev->regs[index] &= ~val;
+            /* Not write one to clear, which is what this was: "Software
+               sets the status bits to 0 by writing a 0 to them. Only the
+               ESC hardware can set status bits to a 1. Software writing a
+               1 to any of the status bits has no effect." So a written
+               bit keeps what is there and a written zero takes it away. */
+            dev->regs[index] &= val;
             break;
         case 0xac: /* CTLTMRL */
         case 0xae: /* CTLTMRH */
@@ -1166,6 +1262,11 @@ esc_reset_hard(esc_t *dev)
     dev->nmi_esc  = 0x00;
     dev->last_mst = 0x00;
 
+    /* SMICNTL comes up 08h, which is the Fast Off timer frozen, and FTMR
+       0Fh, which is the count it will start from once it is let go. */
+    dev->fast_off_count = dev->regs[0xa8];
+    esc_fast_off_remap(dev);
+
     /* EISAID1..4, which 0C80h-0C83h answer from. The book starts them at
        zero for firmware to fill in during configuration; this board's
        firmware never writes them, so what comes back is what the board
@@ -1244,6 +1345,13 @@ esc_init(UNUSED(const device_t *info))
        and they are eight bit accesses only: "This register passes data
        (APM Commands) between the OS and the SMI handler." */
     dev->apm = device_add(&apm_pci_device);
+    /* Its do_smi stays clear: whether a write to APMC raises an SMI is
+       SMIEN bit 7's to say and SMICNTL bit 0's to gate, so the ESC
+       watches the port itself rather than letting the power management
+       device raise one of its own. */
+    io_sethandler(0x00b2, 0x0001, NULL, NULL, NULL, esc_apmc_write,
+                  NULL, NULL, dev);
+    timer_add(&dev->fast_off, esc_fast_off_tick, dev, 0);
 
     dev->port_92 = device_add(&port_92_pci_device);
 
