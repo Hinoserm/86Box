@@ -777,6 +777,23 @@ aic_raise(aic7xxx_t *dev, uint8_t bits)
     aic_update_irq(dev);
 }
 
+/* The faults the book gathers behind BRKADRINT: "This register reports
+   errors that are catastrophic in nature. These errors will cause
+   BRKADRINT to be set and the sequencer to be paused." Whether FAILDIS
+   may suppress the interrupt is the AIC-7770's rule and comes from the
+   chip descriptor, the later parts not being documented to share it. */
+static void
+aic_hard_error(aic7xxx_t *dev, uint8_t bits)
+{
+    dev->error |= bits;
+    if (dev->chip->faildis_honoured) {
+        dev->seqctl &= ~PAUSEDIS;
+        if (dev->seqctl & FAILDIS)
+            return;
+    }
+    aic_raise(dev, BRKADRINT);
+}
+
 /* SCSIINT is the one interrupt the sequencer does not raise itself: the
    SCSI cell raises it, and only for the conditions SIMODE lets through. */
 static void
@@ -2650,6 +2667,14 @@ aic_write(aic7xxx_t *dev, uint8_t addr, uint8_t val, int seq)
         case HADDR + 1:
         case HADDR + 2:
         case HADDR + 3:
+            /* "An attempt to write these registers with HDMAEN (bit 3,
+               DFCNTRL) set will cause ILLSADDR (bit 1, ERROR) to be set."
+               Firmware that works on the real part cannot be doing this,
+               because the silicon stops it there too -- so this firing is
+               a sign the model is holding HDMAEN up where the chip would
+               not. */
+            if (dev->dfcntrl & HDMAEN)
+                aic_hard_error(dev, ILLSADDR);
             if (dev->dscommand1 & 0x03) {
                 dev->misc[addr - HADDR] = val;
                 break;
@@ -2658,13 +2683,13 @@ aic_write(aic7xxx_t *dev, uint8_t addr, uint8_t val, int seq)
             dev->shaddr = (dev->shaddr & ~(0xffU << ((addr - HADDR) * 8))) | ((uint32_t) val << ((addr - HADDR) * 8));
             break;
         case HCNT:
-            dev->hcnt = (dev->hcnt & 0xffff00) | val;
-            break;
         case HCNT + 1:
-            dev->hcnt = (dev->hcnt & 0xff00ff) | (val << 8);
-            break;
         case HCNT + 2:
-            dev->hcnt = (dev->hcnt & 0x00ffff) | (val << 16);
+            /* The count carries the same sentence as the address. */
+            if (dev->dfcntrl & HDMAEN)
+                aic_hard_error(dev, ILLSADDR);
+            dev->hcnt = (dev->hcnt & ~(0xffU << ((addr - HCNT) * 8))) |
+                        ((uint32_t) val << ((addr - HCNT) * 8));
             break;
         case SCBPTR:
             /* Bits 1:0 pick the page, bit 2 reads back what was put in it
@@ -2747,12 +2772,22 @@ aic_write(aic7xxx_t *dev, uint8_t addr, uint8_t val, int seq)
                 aic_seq_kick(dev);
             break;
         case DFWADDR:
+            /* The last of the four causes: DFIFO written "when HDMAEN or
+               SDMAEN is set". It is the pointers that are meant and not
+               DFDAT -- the data register is how the FIFO is fed by hand,
+               and is written under SCSIEN as a matter of course -- while
+               moving the pointers under a running engine is what corrupts
+               it. */
+            if (dev->dfcntrl & (HDMAEN | SDMAEN))
+                aic_hard_error(dev, ILLSADDR);
             dev->dfwaddr[0] = val;
             break;
         case DFWADDR + 1:
             dev->dfwaddr[1] = val;
             break;
         case DFRADDR:
+            if (dev->dfcntrl & (HDMAEN | SDMAEN))
+                aic_hard_error(dev, ILLSADDR);
             dev->dfraddr[0] = val;
             break;
         case DFRADDR + 1:
@@ -3062,7 +3097,12 @@ aic_seq_step(aic7xxx_t *dev)
             break;
 
         default:
-            dev->error |= ILLOPCODE;
+            /* ILLSADDR goes with it: that bit is "set when the Sequencer
+               accesses an address which does not decode to a defined
+               register, an Illegal Opcode is detected, ...". It is the
+               AIC-7770's book, so take it from the descriptor -- the part
+               whose bad address is ILLSADDR is the part it describes. */
+            dev->error |= ILLOPCODE | (dev->chip->bad_addr_err & ILLSADDR);
             dev->seqctl &= ~PAUSEDIS;
             if (dev->chip->faildis_honoured && (dev->seqctl & FAILDIS))
                 return;
