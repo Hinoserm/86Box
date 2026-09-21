@@ -1429,6 +1429,14 @@ aic_select_done(void *priv)
     if ((dev->scsiseq & ENSELO) && ((sd == NULL) || !scsi_device_present(sd)) &&
         !(dev->sxfrctl1 & ENSTIMER)) {
         aic_log("select %i: nobody, and no selection timer\n", id);
+        /* Leaving the selection running is not the same as leaving the
+           timer half armed. timer_on_auto() resumes from the previous
+           expiry while period is still positive, so the arming in the
+           SXFRCTL1 write -- the driver switching ENSTIMER on and asking
+           for the timeout after all -- would schedule from an expiry
+           already in the past rather than from now. Stop it, the way
+           aic_seq_timer does. */
+        timer_stop(&dev->sel_timer);
         return;
     }
 
@@ -2298,8 +2306,15 @@ aic_write(aic7xxx_t *dev, uint8_t addr, uint8_t val, int seq)
             val &= dev->chip->sxfrctl1_mask;
             was           = dev->sxfrctl1;
             dev->sxfrctl1 = val;
-            /* The timer switched on under a selection nobody is answering. */
-            if ((val & ENSTIMER) && !(was & ENSTIMER) && dev->selecting && !timer_is_on(&dev->sel_timer))
+            /* The timer switched on under a selection nobody is
+               answering. timer_is_on() asks whether a long period has
+               been split, not whether the timer is running, and a
+               hundred microseconds is never split -- so it answered no
+               through a countdown that was still going and restarted it
+               from the top. What this wants to know is whether the timer
+               is still armed at all. */
+            if ((val & ENSTIMER) && !(was & ENSTIMER) && dev->selecting &&
+                !timer_is_enabled(&dev->sel_timer))
                 timer_on_auto(&dev->sel_timer, 100.0);
             if (val & BITBUCKET)
                 aic_pump(dev);
