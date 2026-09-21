@@ -47,6 +47,7 @@
 #include <86box/eisa.h>
 #include <86box/scsi.h>
 #include <86box/scsi_device.h>
+#include <86box/scsi_aha1740.h>
 #include <86box/plat_unused.h>
 
 #ifdef ENABLE_AHA1740_LOG
