@@ -231,6 +231,13 @@ aic_log(const char *fmt, ...)
 #define HA_274_BIOSGLOBAL 0x56 /* bit 0: extended translation */
 #define SCSICONF          0x5a /* terminators, parity, and our own ID */
 #define SCSICONF_B        0x5b
+/* Its bits, as the driver reads them back: bit 7 says the terminators are
+   on, which it turns into STPWEN in SXFRCTL1; bit 6 asks for a bus reset
+   at start; bit 5 is parity checking, which it passes into SXFRCTL1 as
+   the same bit; and the bottom three are the adapter's own SCSI ID. */
+#define TERM_ENB          0x80
+#define RESET_SCSI        0x40
+#define HSCSIID           0x07
 #define INTDEF            0x5c /* bit 7 edge triggered, bits 3:0 the IRQ */
 /* HOSTCONF: bits 7:6 the data FIFO threshold, 11 for 100% down to 00 for
    none, and bits 5:2 the bus release time in BCLKs -- 1111 for sixty,
@@ -2355,10 +2362,13 @@ aic_write(aic7xxx_t *dev, uint8_t addr, uint8_t val, int seq)
 
             if (addr == INTDEF) {
                 /* The low four bits are the interrupt itself, not an index
-                   into a list of them. */
+                   into a list of them. The trigger is not here: it is
+                   IRQMS in HCNTRL, so report that rather than bit 7, which
+                   this line used to read and which the configuration
+                   utility writes as zero whatever the trigger. */
                 if (dev->irq != (val & 0x0f))
                     aic_log("aic7770: IRQ %i, %s triggered\n", val & 0x0f,
-                            (val & 0x80) ? "edge" : "level");
+                            (dev->hcntrl & IRQMS) ? "level" : "edge");
                 dev->irq = val & 0x0f;
             } else if (addr == HA_274_BIOSCTRL) {
                 dev->bios_ctl_set = 1;
@@ -4224,14 +4234,36 @@ aic_init(const device_t *info)
 
         dev->eisa_slot = (uint8_t) device_get_config_int("slot");
 
-        /* A 274x has no jumpers. Which interrupt it drives, how it is
-           triggered, what its own SCSI identifier is, where its option ROM
-           answers and whether it answers at all are every one of them
-           written into the configuration chip by the system firmware,
-           replaying the records the configuration utility worked out and
-           stored. Until that happens the board is unconfigured, and this
-           is what unconfigured looks like. */
+        /* A 274x has no jumpers. Which interrupt it drives, where its
+           option ROM answers and whether it answers at all are written
+           into the configuration chip by the system firmware, replaying
+           the records the configuration utility worked out. Until that
+           happens the board is unconfigured, and this is what
+           unconfigured looks like. */
         memset(dev->eisa_conf, 0, sizeof(dev->eisa_conf));
+
+        /* Its own SCSI identifier is not among them, which this used to
+           claim it was. !ADP7771.CFG declares zC5Ah as a word and then
+           never writes it: the utility's whole repertoire is the
+           interrupt, the bus release time, the FIFO threshold and the
+           option ROM address, and there is no INIT for that port at all.
+
+           The driver still expects to read it. On anything but a PCI
+           card it only reads these -- "only set the SCSICONF and
+           SCSICONF + 1 registers if we are a PCI card" -- and takes the
+           adapter apart from what it finds: "temp_p->scsi_id =
+           (temp_p->adapter_control >> 8) & HSCSIID", the terminators
+           from TERM_ENB, and parity from ENSPCHK on its way into
+           SXFRCTL1. Left at zero it would read an adapter at ID 0, with
+           no terminators and no parity checking, which is not a card
+           anyone shipped.
+
+           So the board comes up holding what its own setup would have
+           stored: identifier seven, terminators on, parity on. The bus
+           reset bit stays clear, since nothing here reads it and asking
+           for a reset that was never configured is worse than not. */
+        dev->eisa_conf[SCSICONF - SCSICONF]   = TERM_ENB | ENSPCHK | 7;
+        dev->eisa_conf[SCSICONF_B - SCSICONF] = TERM_ENB | ENSPCHK | 7;
         dev->eisa_global  = 0x00;
         dev->bios_ctl_set = 0;
         dev->irq          = 0;
