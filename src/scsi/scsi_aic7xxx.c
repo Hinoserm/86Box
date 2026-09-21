@@ -2982,6 +2982,24 @@ aic_seq_flags_logic(aic7xxx_t *dev, uint8_t result)
    rotate left, the high four how many bits to then clear, and bit 3
    says which end they are cleared from. That is how the assembler
    builds shl, shr, rol and ror out of the one instruction. */
+/* Opcode 5 is the whole shift and rotate family, and the immediate says
+   which: the low nibble is how far to rotate left, bit 3 of it also
+   marking a rightward shift, and the high nibble how many bits the mask
+   keeps. A right shift by N is therefore a rotate of (8-N) | 8 with N in
+   the high nibble.
+ 
+   Two firmwares agree on that and on nothing else, which is what makes it
+   a check. Linux's writes "shr A,4,SAVED_TCL" to lift the target out of
+   the high nibble of a TCL; the AHA-2740's ROM does the same job as raw
+   encoding, its one and only opcode 5 being ROL SINDEX, SCB[1], 4Ch. Put
+   N=4 through the rule above and the immediate is (8-4)|8 = Ch low, 4
+   high -- 4Ch, the byte in the ROM. Decoded here that is a rotate left of
+   four masked to 0Fh, and for eight bits that is exactly a shift right of
+   four.
+ 
+   The instruction after it in the ROM tests bit 3 of the same SCB byte,
+   which is the channel bit of a TCL, so the surrounding code agrees about
+   what it was reading too. */
 static uint8_t
 aic_rotate(uint8_t src, uint8_t ctl)
 {
