@@ -3183,7 +3183,29 @@ aic_seq_step(aic7xxx_t *dev)
         case OP_JNC:
             /* These also pass an argument: the source register ORed with
                the immediate lands in SINDEX, which is how the firmware
-               hands a value to the routine it is calling. */
+               hands a value to the routine it is calling.
+
+               JC and JNC are the two opcodes nothing here has ever been
+               seen to use, and it is not for want of looking. The only
+               genuine sequencer image among the Adaptec ROMs on hand is
+               the AHA-2740's, 349 instructions with twelve distinct
+               opcodes and neither of these among them, and the Linux
+               firmware does not write jc or jnc either.
+
+               Two other ROMs look at first as though they do, and both
+               are worth naming so the search is not repeated. The 2940UW
+               images decode as thousands of instructions only because
+               that part of the ROM is zero filled -- a zero word is a
+               well formed OR -- and the sequencer holds 512 in any case.
+               And the "U12 27C128 Microcode" that shows a JC and a JNC
+               belongs to an AHA-154x, which has no sequencer of this kind
+               at all; its branch targets do not stay inside the run,
+               which is the tell.
+
+               So the carry these test is verified, by the add and adc
+               chains, and the branching around it is verified, by every
+               other jump in the 2740's program. That the two of them put
+               those together correctly is inference, not evidence. */
             a = aic_read(dev, src, 1);
             aic_write(dev, SINDEX, (uint8_t) (a | imm), 1);
             taken = 1;
