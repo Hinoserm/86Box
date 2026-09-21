@@ -47,6 +47,7 @@
 #include <86box/eisa.h>
 #include <86box/scsi.h>
 #include <86box/scsi_device.h>
+#include <86box/rom.h>
 #include <86box/scsi_aha1740.h>
 #include <86box/plat_unused.h>
 
@@ -185,6 +186,9 @@ typedef struct aha1740_t {
     uint8_t id;       /* the adapter's own SCSI address */
     uint8_t enhanced; /* PORTADR bit 7 */
 
+    rom_t   bios;
+    uint8_t has_bios;
+
     pc_timer_t timer;
     uint32_t   pending_ecb;
     uint8_t    pending_target;
@@ -202,6 +206,31 @@ static const uint16_t aha1740_product[4] = { 0x0000, 0x0001, 0x0002, 0x0400 };
 
 /* The interrupt the card may be configured for, as INTDEF selects it. */
 static const uint8_t aha1740_intab[8] = { 9, 10, 11, 12, 0, 14, 15, 0 };
+
+/* The BIOS address register says where the option ROM answers and whether
+   it answers at all. The configuration utility writes it, so the setting
+   here is only the starting point. */
+static uint32_t
+aha1740_bios_base(const aha1740_t *dev)
+{
+    return 0xc0000 + (((uint32_t) (dev->regs[AHA_BIOSADR] >> 1) & 0x07) << 14);
+}
+
+static void
+aha1740_bios_remap(aha1740_t *dev)
+{
+    if (!dev->has_bios)
+        return;
+
+    if (dev->regs[AHA_BIOSADR] & 0x01) {
+        mem_mapping_set_addr(&dev->bios.mapping, aha1740_bios_base(dev), 0x4000);
+        mem_mapping_enable(&dev->bios.mapping);
+        aha1740_log("AHA1740: BIOS at %05x\n", aha1740_bios_base(dev));
+    } else {
+        mem_mapping_disable(&dev->bios.mapping);
+        aha1740_log("AHA1740: BIOS off\n");
+    }
+}
 
 static void
 aha1740_irq(aha1740_t *dev, int set)
@@ -592,6 +621,11 @@ aha1740_write(uint16_t port, uint8_t val, void *priv)
             dev->enhanced  = !!(val & PORTADDR_ENH);
             break;
 
+        case AHA_BIOSADR:
+            dev->regs[off] = val;
+            aha1740_bios_remap(dev);
+            break;
+
         case AHA_INTDEF:
             dev->regs[off] = val;
             dev->irq       = aha1740_intab[val & 0x07];
@@ -629,7 +663,8 @@ aha1740_reset(void *priv)
        writes and what every EISA driver expects to find. */
     dev->regs[AHA_EBCNTRL] = 0x01;
     dev->regs[AHA_PORTADR] = PORTADDR_ENH;
-    dev->regs[AHA_BIOSADR] = 0x00;
+    /* Left as the configuration utility set it; aha1740_bios_remap() is
+       what acts on it. */
     dev->regs[AHA_INTDEF]  = 0x01; /* IRQ 10, level triggered */
     dev->regs[AHA_SCSIDEF] = 0x07; /* the adapter is target seven */
     dev->regs[AHA_BUSDEF]  = 0x00;
@@ -667,6 +702,25 @@ aha1740_init(const device_t *info)
         return NULL;
     }
 
+    /* The card's own BIOS, which is what an INT 13h boot needs. There is
+       no canonical dump of these in the ROM set, so the image is named by
+       the user rather than picked from a list. */
+    if (device_get_config_int("bios")) {
+        const char *fn = device_get_config_string("bios_fn");
+
+        if ((fn != NULL) && (fn[0] != '\0')) {
+            dev->regs[AHA_BIOSADR] = (uint8_t)
+                (((device_get_config_int("bios_addr") & 0x07) << 1) | 0x01);
+
+            if (rom_init(&dev->bios, fn, aha1740_bios_base(dev), 0x4000,
+                         0x3fff, 0, MEM_MAPPING_EXTERNAL) >= 0) {
+                dev->has_bios = 1;
+                aha1740_bios_remap(dev);
+            } else
+                aha1740_log("AHA1740: could not read %s\n", fn);
+        }
+    }
+
     timer_add(&dev->timer, aha1740_callback, dev, 0);
 
     aha1740_log("AHA1740: slot %i, id %02x%02x%02x%02x\n", dev->slot, id[0],
@@ -689,6 +743,49 @@ aha1740_close(void *priv)
 
 static const device_config_t aha1740_config[] = {
     // clang-format off
+    {
+        .name           = "bios",
+        .description    = "Enable BIOS",
+        .type           = CONFIG_BINARY,
+        .default_string = NULL,
+        .default_int    = 0,
+        .file_filter    = NULL,
+        .spinner        = { 0 },
+        .selection      = { { 0 } },
+        .bios           = { { 0 } }
+    },
+    {
+        .name           = "bios_fn",
+        .description    = "BIOS image",
+        .type           = CONFIG_FNAME,
+        .default_string = "",
+        .default_int    = 0,
+        .file_filter    = "BIOS images (*.bin *.rom)|*.bin;*.rom|All files (*.*)|*.*",
+        .spinner        = { 0 },
+        .selection      = { { 0 } },
+        .bios           = { { 0 } }
+    },
+    {
+        .name           = "bios_addr",
+        .description    = "BIOS address",
+        .type           = CONFIG_SELECTION,
+        .default_string = NULL,
+        .default_int    = 4,
+        .file_filter    = NULL,
+        .spinner        = { 0 },
+        .selection      = {
+            { .description = "C0000H", .value = 0 },
+            { .description = "C4000H", .value = 1 },
+            { .description = "C8000H", .value = 2 },
+            { .description = "CC000H", .value = 3 },
+            { .description = "D0000H", .value = 4 },
+            { .description = "D4000H", .value = 5 },
+            { .description = "D8000H", .value = 6 },
+            { .description = "DC000H", .value = 7 },
+            { .description = ""                   }
+        },
+        .bios           = { { 0 } }
+    },
     {
         .name           = "slot",
         .description    = "EISA slot",
