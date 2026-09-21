@@ -1855,8 +1855,6 @@ aic_read(aic7xxx_t *dev, uint8_t addr, int seq)
     if (!seq)
         aic_host_catch_up(dev);
 
-    }
-
     if ((addr >= SRAM_BASE) && (addr < 0x60))
         return dev->sram[addr - SRAM_BASE];
     if (addr >= SCB_BASE) {
