@@ -650,24 +650,29 @@ esc_cram_decode(esc_t *dev)
         }
     }
 
-    /* Bit 7 is deliberately not acted on, and this is the one place the
-       model knowingly departs from the book.
+    /* Bit 7 is not acted on, and that is what the book asks for once the
+       register family is read as a whole. PCSA, the register beside this
+       one, says what "disable" means here: "This register is used to
+       enable or disable accesses to the RTC, keyboard controller, Floppy
+       Disk controller, and IDE. Disabling any of these bits will prevent
+       the chip select and X-Bus transceiver control signal (XBUSOE#) for
+       that device from being generated." It withdraws the strobes the ESC
+       drives an external part with, not an address claim. PCSB is the same
+       family -- "enable or disable generation of the X-Bus transceiver
+       signal (XBUSOE#)" -- and bit 7 names the strobes it withdraws,
+       CRAMRD# and CRAMWR#, which the configuration SRAM hangs off along
+       with the CPG[4:0] address lines.
 
-       This board's firmware clears it once, early in POST -- it writes
-       PCSB 7Fh, which disables the parallel port decode in the same write
-       because the Super I/O has that -- and never sets it again. It also
-       clears MS bit 5, the configuration RAM page address generation.
-       Two independent ways of saying the same thing: there is no
-       configuration SRAM behind the ESC on this board.
+       There is no X-Bus here. The RTC, the keyboard controller, the floppy
+       controller and IDE are all modelled as the devices they are rather
+       than as things the ESC selects, and none of them watch PCSA either;
+       the configuration RAM is storage for the same reason. This board's
+       firmware clears the bit, and on the real machine that stops the ESC
+       strobing an SRAM that answers the bus regardless -- which is why it
+       goes on using the window all through POST, as it does here.
 
-       The EISA configuration store lives in that RAM here, though, and
-       obeying the bit was tried: the store goes unreadable for the whole
-       of the machine's life and the firmware stops configuring the cards
-       in the slots altogether -- the AHA-2740 comes up with no interrupt
-       and no option ROM window. The real board must keep its store
-       somewhere else, the flash its firmware writes being the obvious
-       candidate, and until that is modelled the window has to stay
-       decoded for anything in a slot to be configured at all. */
+       Port 92 below is different and is acted on: that one is the ESC's
+       own register, and the book gives it no strobe to withdraw. */
     (void) want;
 }
 
