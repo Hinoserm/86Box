@@ -190,6 +190,9 @@ typedef struct aha1740_t {
 
     rom_t   bios;
     uint8_t has_bios;
+    /* The last two kilobytes of the window are RAM the firmware keeps its
+       working copy in, overlaying the ROM underneath. */
+    uint8_t bios_ram[2048];
 
     pc_timer_t timer;
     uint32_t   pending_ecb;
@@ -208,6 +211,66 @@ static const uint16_t aha1740_product[4] = { 0x0000, 0x0001, 0x0002, 0x0400 };
 
 /* The interrupt the card may be configured for, as INTDEF selects it. */
 static const uint8_t aha1740_intab[8] = { 9, 10, 11, 12, 0, 14, 15, 0 };
+
+/* The overlay: the top two kilobytes of the window answer from RAM once
+   RAMEN is set, and take writes while WRTPRT is clear. The rest of the
+   window is the ROM. */
+/* The manual's scan reads "RAMEN (BIOSADDR bit 6)", but the card's own
+   option ROM sets bit 5 to switch the overlay in and clears it again when
+   it gives up on it, so bit 5 is what this is. */
+#define AHA_BIOS_RAMEN  0x20
+#define AHA_BIOS_WRTPRT 0x80
+#define AHA_BIOS_RAMOFF 0x3800
+
+static uint8_t
+aha1740_bios_read(uint32_t addr, void *priv)
+{
+    const aha1740_t *dev = (const aha1740_t *) priv;
+    uint32_t         off = addr & 0x3fff;
+
+    if ((off >= AHA_BIOS_RAMOFF) && (dev->regs[AHA_BIOSADR] & AHA_BIOS_RAMEN))
+        return dev->bios_ram[off - AHA_BIOS_RAMOFF];
+
+    return dev->bios.rom[off & dev->bios.mask];
+}
+
+static void
+aha1740_bios_write(uint32_t addr, uint8_t val, void *priv)
+{
+    aha1740_t *dev = (aha1740_t *) priv;
+    uint32_t   off = addr & 0x3fff;
+
+    if ((off >= AHA_BIOS_RAMOFF) && !(dev->regs[AHA_BIOSADR] & AHA_BIOS_WRTPRT))
+        dev->bios_ram[off - AHA_BIOS_RAMOFF] = val;
+}
+
+static uint16_t
+aha1740_bios_readw(uint32_t addr, void *priv)
+{
+    return aha1740_bios_read(addr, priv) |
+           ((uint16_t) aha1740_bios_read(addr + 1, priv) << 8);
+}
+
+static uint32_t
+aha1740_bios_readl(uint32_t addr, void *priv)
+{
+    return aha1740_bios_readw(addr, priv) |
+           ((uint32_t) aha1740_bios_readw(addr + 2, priv) << 16);
+}
+
+static void
+aha1740_bios_writew(uint32_t addr, uint16_t val, void *priv)
+{
+    aha1740_bios_write(addr, val & 0xff, priv);
+    aha1740_bios_write(addr + 1, (val >> 8) & 0xff, priv);
+}
+
+static void
+aha1740_bios_writel(uint32_t addr, uint32_t val, void *priv)
+{
+    aha1740_bios_writew(addr, val & 0xffff, priv);
+    aha1740_bios_writew(addr + 2, (val >> 16) & 0xffff, priv);
+}
 
 /* BIOSADDR (zCC1): the low four bits are BIOSSEL, which picks a sixteen
    kilobyte boundary, and zero means the BIOS is not mapped at all. Bit 6
@@ -726,6 +789,11 @@ aha1740_init(const device_t *info)
             if (rom_init(&dev->bios, fn, aha1740_bios_base(dev), 0x4000,
                          0x3fff, 0, MEM_MAPPING_EXTERNAL) >= 0) {
                 dev->has_bios = 1;
+                mem_mapping_set_handler(&dev->bios.mapping,
+                                        aha1740_bios_read, aha1740_bios_readw,
+                                        aha1740_bios_readl, aha1740_bios_write,
+                                        aha1740_bios_writew, aha1740_bios_writel);
+                mem_mapping_set_p(&dev->bios.mapping, dev);
                 aha1740_bios_remap(dev);
             } else
                 aha1740_log("AHA1740: could not read %s\n", fn);
