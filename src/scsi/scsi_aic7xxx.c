@@ -2357,6 +2357,20 @@ aic_write(aic7xxx_t *dev, uint8_t addr, uint8_t val, int seq)
             aic_bus_changed(dev);
             break;
         case SCSIRATE:
+            /* Kept for read-back and nothing more, and every field says
+               why. SXFR is the REQ/ACK width and period -- the book gives
+               them in nanoseconds against a 40 MHz clock, 50 nsec at rate
+               zero -- which is a cadence a model that hands over whole
+               bytes has nowhere to put. SOFS picks synchronous or
+               asynchronous handshaking, "an offset value of 0 in the
+               SOFS(3:0) disables synchronous data transfers", and the
+               handshake itself is abstracted here; what software can
+               actually see of the negotiation, the SDTR exchange, is
+               carried by the message code instead. WIDEXFER is read
+               through SELWIDE -- "when SELWIDE is cleared, this bit is
+               ignored" -- and the byte counts either way are the same
+               ones, because the data path here is bytes and not a bus
+               width. */
             dev->scsirate = val;
             break;
         case SCSIID:
@@ -2568,6 +2582,16 @@ aic_write(aic7xxx_t *dev, uint8_t addr, uint8_t val, int seq)
             break;
         case DSCOMMAND1:
             if (dev->eisa) {
+                /* BUSTIME, and read-back is all of it: bus-on and
+                   bus-off are how long the part may hold the host bus
+                   between transfers, "limited to 15 us in increments of
+                   1 us" against "60 us in increments of 4 us", and in
+                   EISA mode BOFF also counts the BCLKs it may keep going
+                   after a preemption. That is the arbitration interval
+                   86Box has no notion of -- the same one the ESC's bus
+                   timeout NMI would need. Register 86h next door,
+                   BUSSPD, is different and is acted on: its top two bits
+                   are the FIFO threshold. */
                 dev->bustime = val;
                 break;
             }
