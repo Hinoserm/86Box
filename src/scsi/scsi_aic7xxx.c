@@ -754,12 +754,27 @@ aic_update_irq(aic7xxx_t *dev)
     aic_log("irq %s intstat %02x\n", fire ? "high" : "low", dev->intstat);
 
     if (dev->eisa) {
-        /* How the board drives the pin is not ours to pick either. Bit 7
-           of INTDEF in the configuration chip says edge or level, and the
-           configuration utility offers both for every interrupt it will
-           hand out -- "IRQ 11 LEVEL" and "IRQ 11 EDGE" are separate
-           choices, and each writes that bit. */
-        if (dev->eisa_conf[INTDEF - SCSICONF] & 0x80) {
+        /* How the pin is driven is IRQMS's to say, and the book leaves no
+           room: "IRQ Mode Select. When set, a low true level interrupt on
+           the IRQ pin is selected. When cleared, a high true edge
+           interrupt on the IRQ pin is selected."
+
+           This used to read bit 7 of INTDEF instead, on the claim that
+           the configuration utility offered a LEVEL and an EDGE choice
+           for each interrupt and wrote that bit to pick between them. It
+           does not. !ADP7771.CFG, on the card's own configuration disk,
+           has six interrupt choices -- 9, 10, 11, 12, 14 and 15 -- every
+           one of them TRIGGER = LEVEL, every one writing INTDEF bit 7 as
+           zero, and every one writing HCNTRL bits 3 and 0: IRQMS set,
+           and a chip reset to go with it.
+
+           The drivers read it back from there too. Linux keeps it in the
+           value it unpauses with -- "the IRQMS bit is only valid on VL
+           and EISA chips" -- sets it for an EISA card, and reports the
+           mode straight out of it. So the old reading landed on level for
+           the right outcome and the wrong reason, and would have been
+           wrong the moment anything cleared IRQMS. */
+        if (!(dev->hcntrl & IRQMS)) {
             if (fire)
                 picint(1 << dev->irq);
             else
