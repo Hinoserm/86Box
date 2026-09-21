@@ -415,23 +415,55 @@ esc_cram_generate(esc_t *dev)
     memcpy(&c[0x2f], dev->embedded_id, 4);
     c[0x33] = 0x50;
 
-    /* Then one for every slot that has a board in it, in the same shape:
-       which slot, the four identifier bytes, and the byte that follows
-       them. Without these the firmware knows a board is there -- it reads
-       the slot itself -- but has nothing recorded about it, and says so. */
+    /* Then a configuration record for every slot that has a board in it,
+       laid out the way the firmware's own "write slot configuration" lays
+       them out: a word of length plus four, a word of index, and then the
+       twelve bytes the EISA services hand over -- slot information, the
+       revision, a checksum, how many functions there are, and the four
+       identifier bytes. The records grow upward from block+FCh, which is
+       where block+0Ah points and what block+06h counts down from. */
     {
-        uint16_t at = 0x34;
+        uint16_t at    = ESC_CRAM_RECS;
+        uint16_t free  = 0x1eb4;
+        uint8_t  count = 0;
 
         for (uint8_t slot = 1; slot <= EISA_MAX_SLOTS; slot++) {
-            if (!eisa_slot_occupied(slot) || (at + 6) > 0x40)
+            uint8_t *r;
+
+            if (!eisa_slot_occupied(slot) || (free < ESC_CRAM_RECLEN + 4))
                 continue;
 
-            c[at] = slot;
+            r = &c[ESC_CRAM_BASE + at];
+            r[0] = ESC_CRAM_RECLEN + 4;
+            r[1] = 0x00;
+            r[2] = count;
+            r[3] = 0x00;
+
+            r[4] = slot;  /* which slot this describes */
+            r[5] = 0x01;  /* the revision of the record */
+            r[6] = 0x00;
+            r[7] = 0x00;  /* its own checksum, filled in below */
+            r[8] = 0x00;
+            r[9] = 0x00;  /* no function records follow */
+            r[10] = 0x00;
             for (uint8_t i = 0; i < 4; i++)
-                c[at + 1 + i] = eisa_slot_id(slot, i);
-            c[at + 5] = 0x50;
-            at = (uint16_t) (at + 6);
+                r[11 + i] = eisa_slot_id(slot, i);
+
+            /* The pointer table, the count, the next free byte and what is
+               left of the room. */
+            c[ESC_CRAM_BASE + 0x0e + (count * 2)]     = (uint8_t) (at & 0xff);
+            c[ESC_CRAM_BASE + 0x0e + (count * 2) + 1] = (uint8_t) (at >> 8);
+
+            at   = (uint16_t) (at + ESC_CRAM_RECLEN + 4);
+            free = (uint16_t) (free - (ESC_CRAM_RECLEN + 4));
+            count++;
         }
+
+        c[ESC_CRAM_BASE + 0x0c] = count;
+        c[ESC_CRAM_BASE + 0x0a] = (uint8_t) (at & 0xff);
+        c[ESC_CRAM_BASE + 0x0b] = (uint8_t) (at >> 8);
+        c[ESC_CRAM_BASE + 0x06] = (uint8_t) (free & 0xff);
+        c[ESC_CRAM_BASE + 0x07] = (uint8_t) (free >> 8);
     }
 
     /* The block keeps a sixteen bit sum of itself, from base+4 to the end

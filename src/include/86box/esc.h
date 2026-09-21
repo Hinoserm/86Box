@@ -24,6 +24,8 @@
 
 /* Thirty-two pages of configuration RAM, one per slot and then some. */
 #define ESC_CRAM_BASE  0x50   /* the firmware reaches the block through this */
+#define ESC_CRAM_RECS   0xfc /* records grow upward from here */
+#define ESC_CRAM_RECLEN 12   /* the smallest the services accept */
 #define ESC_CRAM_ESCD  0x140  /* and the extended data through this */
 #define ESC_CRAM_PAGES 32
 
