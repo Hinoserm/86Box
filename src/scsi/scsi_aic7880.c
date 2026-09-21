@@ -224,6 +224,19 @@ aic_log(const char *fmt, ...)
 #define HOSTCONF          0x5d /* FIFO threshold and bus off time */
 #define HA_274_BIOSCTRL   0x5f /* bits 5:4: 3 means the BIOS is disabled */
 
+/* The top of the option ROM window is not ROM. The board answers the last
+   hundred and twenty eight bytes of it out of a small static RAM, which
+   bit 6 of HA_274_BIOSCTRL switches in and bit 7 write protects, and the
+   card's own BIOS writes patterns there and reads them back before it will
+   install itself -- "Host Adapter shadow RAM test failure!" is what comes
+   out otherwise. It keeps its own variables there afterwards, and fixes up
+   the image checksum at the very last byte so the firmware's scan still
+   accepts the window. */
+#define AIC_BIOS_RAMEN    0x40
+#define AIC_BIOS_WRTPRT   0x80
+#define AIC_BIOS_RAMOFF   0x3f80
+#define AIC_BIOS_RAMSIZE  0x0080
+
 #define SEQCTL       0x60
 #define PERRORDIS    0x80
 #define PAUSEDIS     0x40
@@ -480,6 +493,8 @@ typedef struct aic7880_t {
     uint8_t  eisa_conf[6]; /* 5a, 5b, 5c, 5d, 5e, 5f */
     uint8_t  eisa_global;  /* 56 */
     uint8_t  bios_ctl_set; /* HA_274_BIOSCTRL has been written */
+    uint8_t  bios_ram[AIC_BIOS_RAMSIZE];     /* the overlay */
+    uint8_t  bios_rom_top[AIC_BIOS_RAMSIZE]; /* what it covers */
     uint8_t  bctl;
     uint8_t  bustime;
     uint8_t  busspd;
@@ -530,6 +545,7 @@ static void aic_tgt_next(aic7880_t *dev);
 static void aic_tgt_schedule(aic7880_t *dev);
 static void aic_chip_reset(aic7880_t *dev);
 static void aic_eisa_bios_remap(aic7880_t *dev);
+static void aic_eisa_bios_overlay(aic7880_t *dev);
 static void aic_pio_out(aic7880_t *dev);
 #ifdef ENABLE_AIC7880_LOG
 static const char *aic_phase_name(uint8_t phase);
@@ -2017,6 +2033,7 @@ aic_write(aic7880_t *dev, uint8_t addr, uint8_t val, int seq)
                 dev->irq = val & 0x0f;
             } else if (addr == HA_274_BIOSCTRL) {
                 dev->bios_ctl_set = 1;
+                aic_eisa_bios_overlay(dev);
                 aic_eisa_bios_remap(dev);
             }
         }
@@ -2958,11 +2975,6 @@ aic_chip_reset(aic7880_t *dev)
         memcpy(&dev->sram[SCSICONF - SRAM_BASE], dev->eisa_conf,
                sizeof(dev->eisa_conf));
         dev->sram[HA_274_BIOSGLOBAL - SRAM_BASE] = dev->eisa_global;
-
-        /* A board the configuration utility has enabled comes up with its
-           bus drivers on. The driver reads this before anything else and
-           walks past a slot that reads back disabled. */
-        dev->bctl = 0x01;
     }
 
     memset(dev->scb, 0, sizeof(dev->scb));
@@ -3083,6 +3095,74 @@ aic_seeprom_build(const aic7880_t *dev, uint16_t *nvr)
 
 /* ---- the register window ------------------------------------------------ */
 
+/* Put whichever of the two is showing into the image the rest of the
+   emulator reads, so that the processor fetching code and a bus master
+   fetching a command block both see the same thing. */
+static void
+aic_eisa_bios_overlay(aic7880_t *dev)
+{
+    if (!dev->has_bios || (dev->rom_size < 0x4000))
+        return;
+
+    memcpy(&dev->bios.rom[AIC_BIOS_RAMOFF],
+           (dev->eisa_conf[HA_274_BIOSCTRL - SCSICONF] & AIC_BIOS_RAMEN)
+               ? dev->bios_ram
+               : dev->bios_rom_top,
+           AIC_BIOS_RAMSIZE);
+}
+
+static uint8_t
+aic_eisa_rom_read(uint32_t addr, void *priv)
+{
+    const aic7880_t *dev = (const aic7880_t *) priv;
+
+    return dev->bios.rom[(addr - dev->bios.mapping.base) & (dev->rom_size - 1)];
+}
+
+static uint16_t
+aic_eisa_rom_readw(uint32_t addr, void *priv)
+{
+    return aic_eisa_rom_read(addr, priv) |
+           ((uint16_t) aic_eisa_rom_read(addr + 1, priv) << 8);
+}
+
+static uint32_t
+aic_eisa_rom_readl(uint32_t addr, void *priv)
+{
+    return aic_eisa_rom_readw(addr, priv) |
+           ((uint32_t) aic_eisa_rom_readw(addr + 2, priv) << 16);
+}
+
+static void
+aic_eisa_rom_write(uint32_t addr, uint8_t val, void *priv)
+{
+    aic7880_t *dev = (aic7880_t *) priv;
+    uint32_t   off = (addr - dev->bios.mapping.base) & (dev->rom_size - 1);
+    uint8_t    ctl = dev->eisa_conf[HA_274_BIOSCTRL - SCSICONF];
+
+    if ((off < AIC_BIOS_RAMOFF) || (off >= (AIC_BIOS_RAMOFF + AIC_BIOS_RAMSIZE)) ||
+        (ctl & AIC_BIOS_WRTPRT))
+        return;
+
+    dev->bios_ram[off - AIC_BIOS_RAMOFF] = val;
+    if (ctl & AIC_BIOS_RAMEN)
+        dev->bios.rom[off] = val;
+}
+
+static void
+aic_eisa_rom_writew(uint32_t addr, uint16_t val, void *priv)
+{
+    aic_eisa_rom_write(addr, val & 0xff, priv);
+    aic_eisa_rom_write(addr + 1, (val >> 8) & 0xff, priv);
+}
+
+static void
+aic_eisa_rom_writel(uint32_t addr, uint32_t val, void *priv)
+{
+    aic_eisa_rom_writew(addr, val & 0xffff, priv);
+    aic_eisa_rom_writew(addr + 2, (val >> 16) & 0xffff, priv);
+}
+
 /* HA_274_BIOSCTRL, the last of the five registers the configuration file
    asks the firmware to write. Bits 2:0 pick the sixteen kilobyte window,
    counting up from 0CC000h in the order !ADP7771.CFG lists its choices,
@@ -3150,6 +3230,16 @@ aic_eisa_bios(aic7880_t *dev, const device_t *info)
 
     dev->has_bios = 1;
     dev->rom_size = size;
+
+    mem_mapping_set_handler(&dev->bios.mapping,
+                            aic_eisa_rom_read, aic_eisa_rom_readw,
+                            aic_eisa_rom_readl, aic_eisa_rom_write,
+                            aic_eisa_rom_writew, aic_eisa_rom_writel);
+    mem_mapping_set_p(&dev->bios.mapping, dev);
+
+    if (size >= 0x4000)
+        memcpy(dev->bios_rom_top, &dev->bios.rom[AIC_BIOS_RAMOFF],
+               AIC_BIOS_RAMSIZE);
 
     aic_log("aic7770: BIOS %s, %u KB\n", fn, size >> 10);
     aic_eisa_bios_remap(dev);
