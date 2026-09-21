@@ -1436,8 +1436,12 @@ aic_dma_host(aic7880_t *dev)
 
     if (!(dev->dfcntrl & HDMAEN) || dev->host_wait)
         return;
-    /* No bus mastering, no transfer: MASTEREN in the command register. */
-    if (!(dev->pci_regs[0x04] & 0x04))
+    /* No bus mastering, no transfer: MASTEREN in the PCI command register,
+       or the board's own bus drivers on the EISA part. */
+    if (dev->eisa) {
+        if (!(dev->bctl & 0x01))
+            return;
+    } else if (!(dev->pci_regs[0x04] & 0x04))
         return;
 
     if (dev->dfcntrl & DIRECTION) {
