@@ -1410,6 +1410,11 @@ aic_select_done(void *priv)
        there is simply nothing there, and selecting it runs out. */
     id = (dev->scsiid >> 4) & 0x0f;
     sd = (!dev->wide && (id > 7)) ? NULL : &scsi_devices[dev->bus][id];
+    /* Channel B is a second connector, and a board wired for one has
+       nothing on it. Selecting over there finds no-one and times out,
+       which is how the firmware learns there is nothing to scan. */
+    if ((dev->sblkctl & SELBUSB) && !dev->twin)
+        sd = NULL;
 
     /* Nobody there, and the selection timer not running: the chip goes on
        selecting for ever. CHIPRST leaves ENSTIMER clear, so a driver that
@@ -1473,6 +1478,10 @@ aic_reselect_try(aic7xxx_t *dev)
     if ((dev->bus_state != BUS_FREE) || dev->selecting)
         return;
     if (!(dev->scsiseq & ENRSELI))
+        return;
+    /* Our targets are all on channel A; nothing reconnects while the
+       register file is switched to the other channel. */
+    if ((dev->sblkctl & SELBUSB) && !dev->twin)
         return;
     c = aic_find_reselect(dev);
     if (c == NULL)
@@ -2414,8 +2423,17 @@ aic_write(aic7xxx_t *dev, uint8_t addr, uint8_t val, int seq)
                "will force SELBUSB and SELWIDE to be cleared". The later
                parts put their diagnostic LED and FIFO bits in the same
                register, so they keep the wider mask. */
+            /* SELBUSB is a control bit, not a strap. The straps decide what
+               the register comes up holding; they do not make it read only.
+               The firmware switches channel by writing it -- "and SINDEX,
+               ~SELBUSB, SBLKCTL / and A, SELBUSB, SCB_TCL / or SINDEX, A /
+               mov SBLKCTL, SINDEX" -- and then compares SCB_TCL against
+               SBLKCTL and puts the command back on the queue if the two
+               still disagree. Throwing the write away on a board with one
+               channel therefore does not keep it on channel A: it hangs it,
+               because the command it wants to run is never startable. */
             dev->sblkctl = val & dev->chip->sblkctl_mask &
-                           ~((dev->twin ? 0 : SELBUSB) | (dev->wide ? 0 : SELWIDE));
+                           ~(dev->wide ? 0 : SELWIDE);
             break;
         case SCSITEST:
             /* RQAKCNT, CNTRTEST and CTSTMODE, and nothing above them. */
