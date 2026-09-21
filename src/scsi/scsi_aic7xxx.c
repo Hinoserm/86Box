@@ -3102,6 +3102,36 @@ aic_seq_step(aic7xxx_t *dev)
                         break;
                     }
             }
+            /* Arithmetic writes both flags; the logic operations write
+               zero and leave carry alone. Which way round that goes is
+               not a guess -- the firmware pins it, in set_1byte_addr:
+
+                   add DINDIR, A, SINDIR
+                   mov A, ARG_2
+                   adc DINDIR, A, SINDIR
+                   clr A
+                   adc DINDIR, A, SINDIR
+                   adc DINDIR, A, SINDIR ret
+
+               a thirty-two bit add carrying across four bytes, with a
+               move and a clear sitting between the links. Either one
+               touching carry would break the chain, so neither does.
+
+               The carry itself is the unsigned overflow out of eight
+               bits, which two more idioms fix. A sixteen bit increment
+               reads "clr A; add SG_NEXT[0],SG_SIZEOF; adc SG_NEXT[1],A"
+               -- the second adding nothing but the carry, and doing it
+               through the rule that an immediate of zero means the
+               accumulator. Its counterpart subtracts by adding a two's
+               complement, "add SG_NEXT[0],-SG_SIZEOF; adc SG_NEXT[1],
+               0xff", which only borrows correctly if a carry out of the
+               low byte is what makes FFh plus carry come back to zero.
+
+               A move is one of the logic operations here, which is why
+               it is safe between the links: block move arrived with the
+               command channel and this part has none, so the driver
+               rewrites it before download -- "convert the BMOV to a MOV
+               (AND with an immediate of FF)". */
             if ((opcode == OP_ADD) || (opcode == OP_ADC))
                 aic_seq_flags(dev, res, carry);
             else
