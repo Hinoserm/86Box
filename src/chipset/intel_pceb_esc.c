@@ -88,6 +88,7 @@ typedef struct esc_t {
     uint8_t last_mst; /* 0464h, last EISA bus master granted */
 
     void   *apm;
+    uint8_t cram_decoded;
 
     uint8_t board_id[4];
     uint8_t embedded_id[4]; /* a device soldered to the board */
@@ -617,19 +618,42 @@ esc_set_board_id(const char *mfg, uint16_t product, uint8_t rev)
 
     eisa_make_id(id, mfg, product, rev);
 
-    if (esc_inst != NULL) {
-        memcpy(esc_inst->board_id, id, 4);
-        /* The identifier registers and the I/O window are the same four
-           bytes seen from two sides. */
-        for (uint8_t i = 0; i < 4; i++)
-            esc_inst->regs[0x50 + i] = id[i];
-    }
+    /* What the board is, for anything walking the slots. The chip's own
+       identifier registers are not set from here: the firmware writes
+       those, as it does on the real machine. */
     eisa_set_board_id(id);
 }
 
 /* ------------------------------------------------------------------ */
 /* ESC configuration space                                            */
 /* ------------------------------------------------------------------ */
+
+static uint8_t esc_read(uint16_t port, void *priv);
+static void    esc_write(uint16_t port, uint8_t val, void *priv);
+
+/* PCSB bit 7 says whether the configuration RAM window and its page
+   register are decoded at all. */
+static void
+esc_cram_decode(esc_t *dev)
+{
+    uint8_t want = !!(dev->regs[0x4f] & 0x80);
+
+    if (want == dev->cram_decoded)
+        return;
+    dev->cram_decoded = want;
+
+    if (want) {
+        io_sethandler(0x0800, 0x0100, esc_read, NULL, NULL, esc_write, NULL,
+                      NULL, dev);
+        io_sethandler(0x0c00, 0x0001, esc_read, NULL, NULL, esc_write, NULL,
+                      NULL, dev);
+    } else {
+        io_removehandler(0x0800, 0x0100, esc_read, NULL, NULL, esc_write,
+                         NULL, NULL, dev);
+        io_removehandler(0x0c00, 0x0001, esc_read, NULL, NULL, esc_write,
+                         NULL, NULL, dev);
+    }
+}
 
 static void
 esc_conf_write(esc_t *dev, uint8_t index, uint8_t val)
@@ -672,6 +696,11 @@ esc_conf_write(esc_t *dev, uint8_t index, uint8_t val)
         case 0x4e: /* PCSA */
         case 0x4f: /* PCSB */
             dev->regs[index] = val;
+            /* Bit 7 "is used to enable (1) or disable (0) I/O write
+               accesses to location 0C00h and I/O read/write accesses to
+               locations 0800h-08FFh", which is the configuration RAM
+               window and its page register. */
+            esc_cram_decode(dev);
             break;
 
         case 0x50: /* EISAID1..4 */
@@ -964,16 +993,14 @@ esc_reset_hard(esc_t *dev)
     dev->nmi_esc  = 0x00;
     dev->last_mst = 0x00;
 
-    /* A deviation, and a deliberate one. The book gives EISAID1..4 a reset
-       value of 00h and has the firmware write the identifier in during
-       configuration, so on real silicon 0C80h-0C83h read zero until POST
-       has been through. Here the board tells the chip set what board it is
-       at init, through esc_set_board_id, and that is what these hold from
-       the start. Whether this board's firmware writes them itself has not
-       been established; leaving them zero when it does not would take the
-       system board identifier away entirely, so they are pre-loaded. */
-    for (uint8_t i = 0; i < 4; i++)
-        dev->regs[0x50 + i] = dev->board_id[i];
+    /* EISAID1..4 are zero out of reset and the firmware writes the
+       identifier in during configuration, which is what 0C80h-0C83h then
+       answer with. This board's does: it writes 05 32 09 01, "AIR0901",
+       which is what esc_set_board_id would have put there anyway. */
+    for (uint8_t i = 0; i < 4; i++) {
+        dev->regs[0x50 + i] = 0x00;
+        dev->board_id[i]    = 0x00;
+    }
 
     dma_remove_sg();
     dma_set_sg_base(0x04);
@@ -1051,6 +1078,7 @@ esc_init(UNUSED(const device_t *info))
                   dev);
     io_sethandler(0x0c80, 0x0004, esc_read, NULL, NULL, esc_write, NULL, NULL,
                   dev);
+    dev->cram_decoded = 1;
     io_sethandler(0x0800, 0x0100, esc_read, NULL, NULL, esc_write, NULL, NULL,
                   dev);
     io_sethandler(0x0c00, 0x0001, esc_read, NULL, NULL, esc_write, NULL, NULL,
