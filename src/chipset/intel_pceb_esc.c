@@ -696,6 +696,13 @@ esc_write(uint16_t port, uint8_t val, void *priv)
                 dev->nmi_esc &= ~0x80;
             if (!(val & 0x08))
                 dev->nmi_esc &= ~0x50;
+            /* Bit 0 drives RSTDRV, which resets everything on the bus.
+               Software holds it for a few clocks and takes it away again;
+               the cards see the edge, so reset them as it goes on. */
+            if (val & 0x01) {
+                esc_log("ESC: RSTDRV, resetting the bus\n");
+                eisa_reset();
+            }
             break;
 
         case 0x0462: /* SOFTNMI, a write of any value is the event */
