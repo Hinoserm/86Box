@@ -37,6 +37,7 @@
 #include <86box/device.h>
 #include <86box/io.h>
 #include <86box/mem.h>
+#include <86box/flash.h>
 #include <86box/pci.h>
 #include <86box/timer.h>
 #include <86box/fdd.h>
@@ -96,6 +97,8 @@ machine_at_54tdp_init(const machine_t *model)
 
     /* The board identifier the BIOS reads out of the ESC. */
     esc_set_board_id("AIR", 0x0901, 0);
+    /* The Adaptec soldered to the board, as the firmware records it. */
+    esc_set_embedded_id("ADP", 0x7880, 0);
 
     /* The Adaptec is not optional on this board: it is soldered to it,
        and the system BIOS carries its option ROM. */
@@ -108,6 +111,11 @@ machine_at_54tdp_init(const machine_t *model)
        first, because nothing else needs IRQ 12. Blanking the table is what
        the other dual-capable Socket 7 boards do. */
     device_add(&ioapic_device);
+
+    /* The firmware lives in a Winbond W29C011A, and some of what setup
+       stores goes back into it rather than into CMOS. Without a flash part
+       here those writes land on read-only memory and are lost. */
+    device_add(&winbond_flash_w29c011a_device);
 
     return ret;
 }

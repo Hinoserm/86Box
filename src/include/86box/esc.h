@@ -23,6 +23,8 @@
 #define ESC_UNLOCK_KEY 0x0f
 
 /* Thirty-two pages of configuration RAM, one per slot and then some. */
+#define ESC_CRAM_BASE  0x50   /* the firmware reaches the block through this */
+#define ESC_CRAM_ESCD  0x140  /* and the extended data through this */
 #define ESC_CRAM_PAGES 32
 
 extern const device_t esc_device;  /* 82374SB */
@@ -30,6 +32,8 @@ extern const device_t pceb_device; /* 82375SB */
 
 /* The board identifier the ESC answers with at 0C80-0C83. A machine sets
    this before the BIOS looks. */
+extern void esc_set_embedded_id(const char *mfg, uint16_t product,
+                               uint8_t rev);
 extern void esc_set_board_id(const char *mfg, uint16_t product, uint8_t rev);
 
 #endif /*EMU_ESC_H*/

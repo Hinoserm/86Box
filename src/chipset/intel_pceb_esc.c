@@ -87,6 +87,7 @@ typedef struct esc_t {
     uint8_t last_mst; /* 0464h, last EISA bus master granted */
 
     uint8_t board_id[4];
+    uint8_t embedded_id[4]; /* a device soldered to the board */
 
     /* The EISA configuration RAM: thirty-two pages of two hundred and
        fifty-six bytes, seen through a window at 0800h with the page
@@ -338,6 +339,7 @@ static void
 esc_cram_checksum(uint8_t *page)
 {
     uint16_t sum = 0;
+    uint8_t  csum = 0;
 
     /* The sum over the record, excluding the two checksum bytes, is what
        the BIOS compares against. */
@@ -354,44 +356,102 @@ esc_cram_checksum(uint8_t *page)
 static void
 esc_cram_generate(esc_t *dev)
 {
-    memset(dev->cram, 0, sizeof(dev->cram));
+    uint8_t *c = dev->cram;
+    uint16_t sum  = 0;
+    uint8_t  csum = 0;
 
-    for (uint8_t slot = 0; slot <= EISA_MAX_SLOTS; slot++) {
-        uint8_t *page = &dev->cram[slot * 256];
-        uint8_t  present;
+    memset(c, 0, sizeof(dev->cram));
 
-        if (slot >= ESC_CRAM_PAGES)
-            break;
+    /* The layout the board's own firmware writes, which is the only one it
+       will accept. Everything it cares about is reached through a base it
+       keeps at offset eight, so the words below that are a wrapper and the
+       configuration proper starts at 50h.
 
-        present = (slot == 0) ? 1 : eisa_slot_occupied(slot);
+       Read out of a store the BIOS had just written, and confirmed by
+       disassembling its run-time module: the byte reader puts the page in
+       CONFRAMP and the offset in the window, the block reader adds 50h to
+       every offset it is given, and the check it runs is a plain byte sum
+       over the region whose length sits at base+4. */
+    c[0x00] = 0x55;
+    c[0x01] = 0xaa;
+    /* c[4] is the store's own checksum and is filled in at the end. */
+    c[0x06] = 0x42;
+    c[0x08] = ESC_CRAM_BASE;    /* where the block starts   */
+    c[0x0a] = 0x40;             /* where the ESCD starts    */
+    c[0x0b] = 0x01;
+    c[0x0c] = 0x05;
+    c[0x0d] = 0x13;
+    c[0x0e] = 0x10;
+    c[0x0f] = 0xac;
+    c[0x11] = 0x58;
+    c[0x40] = 0x0b;
+    c[0x41] = 0x02;
 
-        if (!present) {
-            /* An empty slot is recorded as empty, not left as rubbish:
-               the BIOS reads every page. */
-            memset(page, 0, 256);
-            page[0] = page[1] = 0xff;
-            esc_cram_checksum(page);
-            continue;
-        }
+    /* The configuration block. base+4 is how much of it is summed, and the
+       sum goes in base+2. */
+    c[ESC_CRAM_BASE + 4] = 0xb0; /* length, 1fb0h */
+    c[ESC_CRAM_BASE + 5] = 0x1f;
+    c[ESC_CRAM_BASE + 6] = 0xb4;
+    c[ESC_CRAM_BASE + 7] = 0x1e;
+    c[ESC_CRAM_BASE + 10] = 0xfc;
 
-        if (slot == 0)
-            memcpy(page, dev->board_id, 4);
-        else {
-            for (uint8_t i = 0; i < 4; i++)
-                page[i + 0] = eisa_slot_id(slot, i);
-        }
+    /* Whose it is. */
+    memcpy(&c[0xf0], "AMI", 3);
 
-        /* Byte four says the slot is occupied and by what: the top two
-           bits are the board type, and the rest of the record is the
-           function list, which is empty because nothing here needs the
-           utility to have allocated anything. */
-        page[4] = 0x01;
-        page[5] = 0x00; /* no function records */
-
-        esc_cram_checksum(page);
+    /* The extended configuration data, exactly the fourteen bytes the
+       firmware copies in when it starts a store from nothing. */
+    {
+        static const uint8_t escd[14] = {
+            0x0e, 0x00, 'A', 'C', 'F', 'G', 0x01, 0x02,
+            0x00, 0x00, 0x00, 0x00, 0xde, 0xfe
+        };
+        memcpy(&c[ESC_CRAM_ESCD], escd, sizeof(escd));
     }
 
-    esc_log("ESC: configuration RAM generated\n");
+    /* A device soldered to the board is recorded even with nothing in any
+       slot: on this one that is the Adaptec, which the firmware writes as
+       ADP7880 whatever the board identifier says. */
+    c[0x2e] = 0x05;
+    memcpy(&c[0x2f], dev->embedded_id, 4);
+    c[0x33] = 0x50;
+
+    /* Then one for every slot that has a board in it, in the same shape:
+       which slot, the four identifier bytes, and the byte that follows
+       them. Without these the firmware knows a board is there -- it reads
+       the slot itself -- but has nothing recorded about it, and says so. */
+    {
+        uint16_t at = 0x34;
+
+        for (uint8_t slot = 1; slot <= EISA_MAX_SLOTS; slot++) {
+            if (!eisa_slot_occupied(slot) || (at + 6) > 0x40)
+                continue;
+
+            c[at] = slot;
+            for (uint8_t i = 0; i < 4; i++)
+                c[at + 1 + i] = eisa_slot_id(slot, i);
+            c[at + 5] = 0x50;
+            at = (uint16_t) (at + 6);
+        }
+    }
+
+    /* The block keeps a sixteen bit sum of itself, from base+4 to the end
+       of the region whose length sits at base+4. */
+    for (uint16_t i = ESC_CRAM_BASE + 4; i < sizeof(dev->cram); i++)
+        sum = (uint16_t) (sum + c[i]);
+    c[ESC_CRAM_BASE + 2] = (uint8_t) (sum & 0xff);
+    c[ESC_CRAM_BASE + 3] = (uint8_t) (sum >> 8);
+
+    /* And the store as a whole carries one byte at offset four chosen so
+       that every byte in it adds up to nothing. The firmware zeroes that
+       byte, sums the lot and writes back the negation; anything else and
+       it throws the store away and builds its own. */
+    c[0x04] = 0x00;
+    for (uint16_t i = 0; i < sizeof(dev->cram); i++)
+        csum = (uint8_t) (csum + c[i]);
+    c[0x04] = (uint8_t) (-csum);
+
+    esc_log("ESC: configuration RAM built, block sum %04x, store byte %02x\n",
+            sum, c[0x04]);
 }
 
 static void
@@ -488,6 +548,13 @@ esc_cram_save(esc_t *dev)
 /* ------------------------------------------------------------------ */
 /* The board identifier                                               */
 /* ------------------------------------------------------------------ */
+
+void
+esc_set_embedded_id(const char *mfg, uint16_t product, uint8_t rev)
+{
+    if (esc_inst != NULL)
+        eisa_make_id(esc_inst->embedded_id, mfg, product, rev);
+}
 
 void
 esc_set_board_id(const char *mfg, uint16_t product, uint8_t rev)
