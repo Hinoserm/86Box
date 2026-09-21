@@ -43,6 +43,7 @@ add_executable(86Box
     port_92.c
     ppi.c
     pci.c
+    eisa.c
     mca.c
     usb.c
     device.c
@@ -151,7 +152,7 @@ endif()
 
 if(STATIC_BUILD)
     if(MINGW OR UNIX)
-        target_link_options(86Box PRIVATE "-static")
+        # target_link_options(86Box PRIVATE "-static")  # cross-build: ship DLLs
         set(CMAKE_FIND_LIBRARY_SUFFIXES ".a")
     endif()
 
@@ -298,4 +299,8 @@ endif()
 
 if(CMAKE_SYSTEM_NAME MATCHES "NetBSD")
     add_custom_command(TARGET 86Box POST_BUILD COMMAND paxctl ARGS +m $<TARGET_FILE:86Box> COMMENT "Disable PaX MPROTECT")
+endif()
+
+if(WIN32 AND NOT MSVC)
+    target_link_libraries(86Box winmm)
 endif()
