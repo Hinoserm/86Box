@@ -477,8 +477,10 @@ esc_cram_load(esc_t *dev)
 
     fp = nvr_fopen(dev->cram_file, "rb");
     if (fp == NULL) {
-        /* Nothing saved yet. */
-        esc_cram_generate(dev);
+        /* Nothing saved yet. With automatic configuration off the guest
+           gets an empty store and may do as it likes with it. */
+        if (dev->cram_auto)
+            esc_cram_generate(dev);
         return;
     }
 
@@ -531,6 +533,11 @@ static void
 esc_cram_save(esc_t *dev)
 {
     FILE *fp;
+
+    /* With the machine's automatic configuration switched off the store is
+       the guest's business alone, and we do not write the file. */
+    if (!dev->cram_auto)
+        return;
 
     /* If the guest never looked at the store the signature is still the
        one the file came with, which is what should go back. */
@@ -968,7 +975,10 @@ esc_init(UNUSED(const device_t *info))
                     esc_apic_writeb, esc_apic_writew, esc_apic_writel,
                     NULL, MEM_MAPPING_EXTERNAL, dev);
 
-    dev->cram_auto = (uint8_t) device_get_config_int("cram_auto");
+    /* The machine owns this now: "Auto EISA Config" on its options page.
+       On, the store is built fresh whenever it is missing or the cards
+       have changed. Off, nothing here writes to it at all. */
+    dev->cram_auto = (uint8_t) machine_get_config_int("auto_eisa_config");
     snprintf(dev->cram_file, sizeof(dev->cram_file), "%s_eisa.nvr",
              machine_get_internal_name());
     esc_cram_load(dev);
@@ -978,26 +988,6 @@ esc_init(UNUSED(const device_t *info))
     return dev;
 }
 
-static const device_config_t esc_config[] = {
-    // clang-format off
-    {
-        .name           = "cram_auto",
-        .description    = "EISA configuration",
-        .type           = CONFIG_SELECTION,
-        .default_string = NULL,
-        .default_int    = 1,
-        .file_filter    = NULL,
-        .spinner        = { 0 },
-        .selection      = {
-            { .description = "Automatic (start again when the cards change)", .value = 1 },
-            { .description = "Manual (EISA configuration utility)",           .value = 0 },
-            { .description = ""                                                      }
-        },
-        .bios           = { { 0 } }
-    },
-    { .name = "", .description = "", .type = CONFIG_END }
-    // clang-format on
-};
 
 const device_t esc_device = {
     .name          = "Intel 82374SB (ESC)",
@@ -1010,7 +1000,7 @@ const device_t esc_device = {
     .available     = NULL,
     .speed_changed = NULL,
     .force_redraw  = NULL,
-    .config        = esc_config
+    .config        = NULL
 };
 
 /* ------------------------------------------------------------------ */

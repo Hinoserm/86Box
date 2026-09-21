@@ -53,6 +53,37 @@
 #include <86box/rom.h>
 #include <86box/keyboard.h>
 
+static const device_config_t at_54tdp_config[] = {
+    // clang-format off
+    {
+        .name           = "auto_eisa_config",
+        .description    = "Auto EISA Config",
+        .type           = CONFIG_BINARY,
+        .default_string = NULL,
+        .default_int    = 1,
+        .file_filter    = NULL,
+        .spinner        = { 0 },
+        .selection      = { { 0 } },
+        .bios           = { { 0 } }
+    },
+    { .name = "", .description = "", .type = CONFIG_END }
+    // clang-format on
+};
+
+const device_t at_54tdp_device = {
+    .name          = "AIR 54TDP",
+    .internal_name = "54tdp_device",
+    .flags         = 0,
+    .local         = 0,
+    .init          = NULL,
+    .close         = NULL,
+    .reset         = NULL,
+    .available     = NULL,
+    .speed_changed = NULL,
+    .force_redraw  = NULL,
+    .config        = at_54tdp_config
+};
+
 int
 machine_at_54tdp_init(const machine_t *model)
 {

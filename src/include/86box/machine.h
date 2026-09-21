@@ -1665,6 +1665,7 @@ extern int             machine_v86p_init(const machine_t *);
 /* 8088 */
 #ifdef EMU_DEVICE_H
 extern const device_t  ibmpc_device;
+extern const device_t  at_54tdp_device;
 #endif
 extern int             machine_ibmpc_init(const machine_t *);
 #ifdef EMU_DEVICE_H
