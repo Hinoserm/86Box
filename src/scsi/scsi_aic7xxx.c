@@ -2357,6 +2357,16 @@ aic_write(aic7xxx_t *dev, uint8_t addr, uint8_t val, int seq)
            EISA store. Keep a copy, because a chip reset clears scratch and
            these have to survive it -- the driver resets the part and only
            then reads its interrupt and its identifier back out. */
+        /* And 56h with them, which is the same kind of byte a little
+           lower down: "these scratch ram locations are initialized by
+           the 274X BIOS. We reuse them after capturing the BIOS settings
+           during initialization." Bit 0 is the extended translation the
+           BIOS chose. There has always been somewhere to keep it across
+           a reset and never anything that put it there, so a reset
+           handed back a zero and the geometry went with it. */
+        if (dev->eisa && (addr == HA_274_BIOSGLOBAL))
+            dev->eisa_global = val;
+
         if (dev->eisa && (addr >= SCSICONF)) {
             dev->eisa_conf[addr - SCSICONF] = val;
 
