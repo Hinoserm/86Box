@@ -837,6 +837,9 @@ esc_write(uint16_t port, uint8_t val, void *priv)
                and clearing an enable also clears the condition it
                reported. */
             dev->nmi_esc = (uint8_t) ((dev->nmi_esc & 0xf0) | (val & 0x0f));
+            /* The book states this clearing for the fail-safe and bus
+               timeout enables below and not for this one; it is done the
+               same way for consistency with them. */
             if (!(val & 0x02))
                 dev->nmi_esc &= ~0x20;
             if (!(val & 0x04))
@@ -961,6 +964,14 @@ esc_reset_hard(esc_t *dev)
     dev->nmi_esc  = 0x00;
     dev->last_mst = 0x00;
 
+    /* A deviation, and a deliberate one. The book gives EISAID1..4 a reset
+       value of 00h and has the firmware write the identifier in during
+       configuration, so on real silicon 0C80h-0C83h read zero until POST
+       has been through. Here the board tells the chip set what board it is
+       at init, through esc_set_board_id, and that is what these hold from
+       the start. Whether this board's firmware writes them itself has not
+       been established; leaving them zero when it does not would take the
+       system board identifier away entirely, so they are pre-loaded. */
     for (uint8_t i = 0; i < 4; i++)
         dev->regs[0x50 + i] = dev->board_id[i];
 
