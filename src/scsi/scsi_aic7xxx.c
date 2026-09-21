@@ -380,6 +380,13 @@ typedef struct aic_chip_t {
     uint8_t     selid_writable;/* SELID is read only on the older part */
     uint8_t     twin_capable;  /* a second SCSI channel to strap */
     uint8_t     seqctl_reset;  /* what SEQCTL comes up holding */
+    uint8_t     sblkctl_reset; /* and SBLKCTL, before the board's straps */
+    uint8_t     own_reset_seen;/* the part reports the bus reset it drives */
+    uint8_t     faildis_honoured; /* FAILDIS suppresses the hard-error
+                                     interrupt, and the interrupt takes
+                                     PAUSEDIS away with it */
+    uint8_t     bad_addr_err;  /* what an address that decodes to nothing
+                                  records in ERROR */
 } aic_chip_t;
 
 /* The AIC-7770. Four SCB pages and two four deep queues; SCBPTR keeps
@@ -407,6 +414,21 @@ static const aic_chip_t aic_chip_7770 = {
        as a one; FASTMODE is not, so the sequencer starts on the slower of
        its two clocks until the firmware asks for the other. */
     .seqctl_reset  = PERRORDIS,
+    /* Out of reset this register is the board's own wiring and nothing
+       else: 08h for two buses, 02h for one wide one, 00h for a single
+       narrow one. The straps are ORed in below. */
+    .sblkctl_reset = 0,
+    /* SCSIRSTI is reset *in*. Reporting the one this part drives itself
+       deadlocks it: the status raises SCSIINT, an unserviced interrupt
+       stops the sequencer, and the sequencer is what times the reset and
+       finishes it. The card's own BIOS settles it -- it enables
+       ENSCSIRST, asserts SCSIRSTO, starts the sequencer and waits. */
+    .own_reset_seen = 0,
+    /* "If set, disables the Illegal Opcode or Address interrupt feature."
+       And an address that decodes to no register is ILLSADDR, not a bad
+       opcode. */
+    .faildis_honoured = 1,
+    .bad_addr_err  = ILLSADDR,
 };
 
 /* The AIC-7870 and AIC-7880, which keep everything the older part had and
@@ -427,6 +449,13 @@ static const aic_chip_t aic_chip_788x = {
     .selid_writable = 1,
     .twin_capable  = 0,
     .seqctl_reset  = PERRORDIS | FASTMODE,
+    /* The diagnostic LED bits come up set. AUTOFLUSHDIS does not, and
+       must not: with it set the part does not flush its data FIFO by
+       itself, and everything waiting on that data stops. */
+    .sblkctl_reset = DIAGLEDEN | DIAGLEDON,
+    .own_reset_seen = 1,
+    .faildis_honoured = 0,
+    .bad_addr_err  = ILLOPCODE,
 };
 
 /* PCI configuration, device specific. */
@@ -1476,13 +1505,8 @@ aic_scsi_reset_bus(aic7xxx_t *dev)
     for (uint8_t i = 0; i < (dev->wide ? 16 : 8); i++)
         scsi_device_reset(&scsi_devices[dev->bus][i]);
 
-    /* SCSIRSTI is reset *in*: a reset arriving from somebody else. The
-       part does not report the one it is driving itself, and it cannot
-       afford to -- an interrupt stops the sequencer, and the sequencer is
-       what times the reset and finishes it. The card's own BIOS proves
-       the point: it enables ENSCSIRST, then asserts SCSIRSTO, then starts
-       the sequencer and waits for it to answer. Nothing else on this bus
-       can drive the line, so the status stays clear. */
+    if (dev->chip->own_reset_seen)
+        aic_set_sstat1(dev, SCSIRSTI);
     aic_bus_changed(dev);
 }
 
@@ -1524,7 +1548,13 @@ aic_fifo_threshold(const aic7xxx_t *dev)
 {
     static const uint16_t level[4] = { 24, FIFO_SIZE / 2, (FIFO_SIZE * 3) / 4, FIFO_SIZE };
 
-    return level[dev->dspcistatus >> 6];
+    /* Register 86h, whichever part this is. On the AIC-7770 it is BUSSPD,
+       and the data book is explicit that "in EISA mode, STBON(3:0) and
+       STBOFF(3:0) have no meaning, but DFTHRSH(1:0) is still used" -- so
+       the threshold is in there, not in the PCI status register the later
+       parts keep it in. Reading the wrong one left the EISA board on the
+       lowest threshold whatever it had been told. */
+    return level[(dev->eisa ? dev->busspd : dev->dspcistatus) >> 6];
 }
 
 /* The hardware flushes by itself when the SCSI side of a read is over:
@@ -2774,13 +2804,17 @@ aic_seq_step(aic7xxx_t *dev)
     int      taken;
 
     if (dev->pc >= SEQ_INSNS) {
-        /* An address that decodes to nothing. FAILDIS turns the interrupt
-           for that off; the error itself is still recorded, and the
-           interrupt takes PAUSEDIS away the same as any other. */
-        dev->error |= ILLSADDR;
-        dev->seqctl &= ~PAUSEDIS;
-        if (!(dev->seqctl & FAILDIS))
-            aic_raise(dev, BRKADRINT);
+        /* An address that decodes to nothing. What the part records for
+           it, whether the interrupt takes PAUSEDIS with it and whether
+           FAILDIS can turn it off are all the AIC-7770 data book's, and
+           are not evidence about the later parts. */
+        dev->error |= dev->chip->bad_addr_err;
+        if (dev->chip->faildis_honoured) {
+            dev->seqctl &= ~PAUSEDIS;
+            if (dev->seqctl & FAILDIS)
+                return;
+        }
+        aic_raise(dev, BRKADRINT);
         return;
     }
 
@@ -2928,8 +2962,9 @@ aic_seq_step(aic7xxx_t *dev)
         default:
             dev->error |= ILLOPCODE;
             dev->seqctl &= ~PAUSEDIS;
-            if (!(dev->seqctl & FAILDIS))
-                aic_raise(dev, BRKADRINT);
+            if (dev->chip->faildis_honoured && (dev->seqctl & FAILDIS))
+                return;
+            aic_raise(dev, BRKADRINT);
             return;
     }
 
@@ -3125,7 +3160,10 @@ aic_chip_reset(aic7xxx_t *dev)
        That is how the card's BIOS learns what it is fitted to. Answering
        0C0h instead left it unable to tell, and it went looking down a
        second bus that is not there. */
-    dev->sblkctl = (dev->chip->sblkctl_mask & ~(SELBUSB | SELWIDE)) |
+    /* A reset value is not a write mask: the mask says which bits the part
+       has, this says what they come up holding. Deriving one from the
+       other set AUTOFLUSHDIS on a part whose reset clears it. */
+    dev->sblkctl = dev->chip->sblkctl_reset |
                    (dev->twin ? SELBUSB : 0) | (dev->wide ? SELWIDE : 0);
     dev->scsitest   = 0;
     dev->sleepctl   = 0;
