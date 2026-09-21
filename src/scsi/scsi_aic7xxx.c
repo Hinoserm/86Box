@@ -232,7 +232,14 @@ aic_log(const char *fmt, ...)
 #define SCSICONF          0x5a /* terminators, parity, and our own ID */
 #define SCSICONF_B        0x5b
 #define INTDEF            0x5c /* bit 7 edge triggered, bits 3:0 the IRQ */
-#define HOSTCONF          0x5d /* FIFO threshold and bus off time */
+/* HOSTCONF: bits 7:6 the data FIFO threshold, 11 for 100% down to 00 for
+   none, and bits 5:2 the bus release time in BCLKs -- 1111 for sixty,
+   0000 for two -- which is how long the card keeps transferring after it
+   is preempted. Board configuration rather than chip register: the driver
+   reads it and copies the threshold across itself, "hostconf =
+   aic_inb(temp_p, HOSTCONF); aic_outb(temp_p, hostconf & DFTHRSH,
+   BUSSPD)", and BUSSPD is where this model reads it from. */
+#define HOSTCONF          0x5d
 #define HA_274_BIOSCTRL   0x5f /* bits 5:4: 3 means the BIOS is disabled */
 
 /* The top of the option ROM window is not ROM. The board answers the last
@@ -3719,10 +3726,19 @@ aic_eisa_rom_writel(uint32_t addr, uint32_t val, void *priv)
 }
 
 /* HA_274_BIOSCTRL, the last of the five registers the configuration file
-   asks the firmware to write. Bits 2:0 pick the sixteen kilobyte window,
-   counting up from 0CC000h in the order !ADP7771.CFG lists its choices,
+   asks the firmware to write. Bits 2:0 pick the sixteen kilobyte window
    and bits 5:4 are the mode, of which three means the BIOS is switched
-   off. Nothing else decides where the ROM answers. */
+   off. Nothing else decides where the ROM answers.
+
+   The windows count up from 0CC000h by value, which is not the order
+   !ADP7771.CFG prints them in -- it leads with D8000h because that is the
+   default. Its eight choices, sorted by what they write:
+
+       000 CC000h   001 D0000h   010 D4000h   011 D8000h
+       100 DC000h   101 E0000h   110 E4000h   111 E8000h
+
+   which is the 0CC000h plus n times 4000h below. Disabled is a ninth
+   choice and writes the mode field instead, bits 5:4 both set. */
 static void
 aic_eisa_bios_remap(aic7xxx_t *dev)
 {
