@@ -690,6 +690,48 @@ static void    esc_write(uint16_t port, uint8_t val, void *priv);
 
 /* PCSB says what the part decodes for itself. Bit 7 is the configuration
    RAM window and its page register, bit 6 is Port 92. */
+/* Which page of the configuration RAM an access to 0800h-08FFh lands on.
+
+   Mode Select bit 5 looks like it should have a say. LA[31:27] and
+   CPG[4:0] are one set of pins that "behave as the EISA address bus under
+   all conditions except during access cycle to the Configuration RAM",
+   where "the ESC drives these signals with the configuration page address
+   (the value contained in register 0C00h). The Configuration RAM Page
+   Address function can be disabled by setting Mode Select register bit
+   5 = 0." Disabled, the pins carry the cycle's own LA[31:27], and for an
+   I/O cycle at 0800h-08FFh those are zero -- so an SRAM taking its top
+   address lines from the ESC would see page zero and nothing else.
+
+   This board's does not take them from the ESC, and its own firmware
+   proves it rather than leaving it to be guessed:
+
+     - it clears the bit. MS is written as (old & 80h) | 4Ch, at
+       F000:E810 and F000:EA6C, and those are the only two writes to it
+       in the image -- the configuration registers are reached through
+       one pair of helpers at F000:EA2B and F000:EA32, every near call
+       and jump to them is accounted for, and there are no far ones;
+     - and it then uses all thirty-two pages, which a POST sweep walks
+       end to end;
+     - over a store whose own block length is 1FB0h and whose checksum
+       runs to the end of the eight kilobytes.
+
+   A store that is checksummed across 8K, by firmware that has just
+   switched off the ESC's page address, can only work if the page address
+   comes from somewhere else -- the board latching 0C00h itself, which it
+   is free to do since the ESC decodes that port in plain sight. So the
+   page register is what selects, and the bit is stored and read back
+   without changing where an access lands.
+
+   An earlier pass here implemented the collapse to page zero on the
+   strength of the pin description alone. That is what the ESC's pins do;
+   it is not what this board does, and the firmware above is the evidence
+   that settles which. */
+static uint8_t
+esc_cram_page(const esc_t *dev)
+{
+    return dev->cram_page;
+}
+
 static void
 esc_cram_decode(esc_t *dev)
 {
@@ -1021,9 +1063,9 @@ esc_write(uint16_t port, uint8_t val, void *priv)
             break;
 
         case 0x0800 ... 0x08ff: /* the configuration RAM itself */
-            esc_log("ESC: cram wr %02x:%02x = %02x\n", dev->cram_page,
+            esc_log("ESC: cram wr %02x:%02x = %02x\n", esc_cram_page(dev),
                     port & 0xff, val);
-            dev->cram[(dev->cram_page * 256) + (port & 0xff)] = val;
+            dev->cram[(esc_cram_page(dev) * 256) + (port & 0xff)] = val;
             break;
 
         case 0x0c80: /* the board identifier is read only from here */
@@ -1055,10 +1097,10 @@ esc_read(uint16_t port, void *priv)
             return dev->cram_page;
 
         case 0x0800 ... 0x08ff:
-            esc_log("ESC: cram rd %02x:%02x = %02x\n", dev->cram_page,
+            esc_log("ESC: cram rd %02x:%02x = %02x\n", esc_cram_page(dev),
                     port & 0xff,
-                    dev->cram[(dev->cram_page * 256) + (port & 0xff)]);
-            return dev->cram[(dev->cram_page * 256) + (port & 0xff)];
+                    dev->cram[(esc_cram_page(dev) * 256) + (port & 0xff)]);
+            return dev->cram[(esc_cram_page(dev) * 256) + (port & 0xff)];
 
         case 0x0464:
             /* Which EISA master was granted the bus last. Nothing here

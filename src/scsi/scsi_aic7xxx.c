@@ -387,6 +387,9 @@ typedef struct aic_chip_t {
                                      PAUSEDIS away with it */
     uint8_t     bad_addr_err;  /* what an address that decodes to nothing
                                   records in ERROR */
+    uint8_t     host_pause_checked; /* the host reaching a register that
+                                       wants the sequencer stopped is
+                                       ILLHADDR */
 } aic_chip_t;
 
 /* The AIC-7770. Four SCB pages and two four deep queues; SCBPTR keeps
@@ -428,6 +431,7 @@ static const aic_chip_t aic_chip_7770 = {
        And an address that decodes to no register is ILLSADDR, not a bad
        opcode. */
     .faildis_honoured = 1,
+    .host_pause_checked = 1,
     .bad_addr_err  = ILLSADDR,
 };
 
@@ -456,6 +460,9 @@ static const aic_chip_t aic_chip_788x = {
     .own_reset_seen = 1,
     .faildis_honoured = 0,
     .bad_addr_err  = ILLOPCODE,
+    /* Off, for the same reason bad_addr_err differs: ILLHADDR's rule is
+       the AIC-7770 book's, and this part's is not to hand. */
+    .host_pause_checked = 0,
 };
 
 /* PCI configuration, device specific. */
@@ -782,6 +789,33 @@ aic_raise(aic7xxx_t *dev, uint8_t bits)
    BRKADRINT to be set and the sequencer to be paused." Whether FAILDIS
    may suppress the interrupt is the AIC-7770's rule and comes from the
    chip descriptor, the later parts not being documented to share it. */
+/* Which registers the host may reach while the sequencer is running. The
+   register map names them and no others: the four board identifier bytes,
+   BCTL, HCNTRL, INTSTAT and CLRINT are "Host only, no pause", ERROR is
+   "Host only", and the outbound queue -- QOUTFIFO and QOUTCNT -- is "Read
+   by Host only, no pause", which is why a write there is not among them.
+   Everything else wants the sequencer stopped first. */
+static int
+aic_host_no_pause(uint8_t addr, int write)
+{
+    switch (addr) {
+        case DSVENDID:     /* BID0 */
+        case DSVENDID + 1: /* BID1 */
+        case DSDEVID:      /* BID2 */
+        case DSDEVID + 1:  /* BID3 */
+        case BCTL:
+        case HCNTRL:
+        case INTSTAT:
+        case ERROR: /* CLRINT on write, and that one is named too */
+            return 1;
+        case QOUTFIFO:
+        case QOUTCNT:
+            return !write;
+        default:
+            return 0;
+    }
+}
+
 static void
 aic_hard_error(aic7xxx_t *dev, uint8_t bits)
 {
@@ -1898,6 +1932,15 @@ aic_read(aic7xxx_t *dev, uint8_t addr, int seq)
     if (!seq)
         aic_host_catch_up(dev);
 
+    /* "Illegal Host Address. This bit is set when the Host accesses a
+       register, which is unavailable to the Host, while the Sequencer is
+       not paused." Setting it pauses the sequencer, which makes the next
+       access legal -- so this reports the first one and then stops, which
+       is what wanted to be reported anyway. */
+    if (!seq && dev->chip->host_pause_checked && !aic_paused(dev) &&
+        !aic_host_no_pause(addr, 0))
+        aic_hard_error(dev, ILLHADDR);
+
     if ((addr >= SRAM_BASE) && (addr < 0x60))
         return dev->sram[addr - SRAM_BASE];
     if (addr >= SCB_BASE) {
@@ -2264,6 +2307,10 @@ aic_write(aic7xxx_t *dev, uint8_t addr, uint8_t val, int seq)
 
     if (!seq)
         aic_host_catch_up(dev);
+
+    if (!seq && dev->chip->host_pause_checked && !aic_paused(dev) &&
+        !aic_host_no_pause(addr, 1))
+        aic_hard_error(dev, ILLHADDR);
 
     if ((addr >= SRAM_BASE) && (addr < 0x60)) {
         dev->sram[addr - SRAM_BASE] = val;
