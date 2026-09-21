@@ -1946,8 +1946,28 @@ aic_read(aic7xxx_t *dev, uint8_t addr, int seq)
         case SSTAT1:
             return dev->sstat1;
         case SSTAT2:
+            /* OVERRUN and the SCSI FIFO byte count. Both are zero here
+               for reasons rather than for convenience: the overrun is a
+               synchronous offset running out -- "the maximum offset has
+               been reached and another REQ is detected before an ACK is
+               asserted" -- which a model that moves a byte at a time
+               cannot reach; and SFCNT counts the sixteen byte SCSI FIFO
+               that sits between the bus and the data FIFO, which is not
+               separately modelled. Software may only read this while
+               transfers are stopped, and stopped is when that FIFO is
+               empty.
+
+               Nothing this part runs reads it. The bits a later driver
+               names above SFCNT -- SHVALID, EXP_ACTIVE, the CRC errors --
+               are Ultra2 and Ultra3 additions laid over the 7770's field,
+               and the one place the sequencer tests SSTAT2 is inside its
+               u2_ data phase, which this chip never reaches. */
             return 0;
         case SSTAT3:
+            /* The synchronous offset counters, and the book says when
+               they may be looked at: "Do not read this counter unless
+               transfers are stopped." Stopped is exactly when both are
+               zero. */
             return 0;
         case SIMODE0:
             return dev->simode0;
