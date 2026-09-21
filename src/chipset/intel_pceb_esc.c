@@ -637,7 +637,7 @@ static void    esc_write(uint16_t port, uint8_t val, void *priv);
 static void
 esc_cram_decode(esc_t *dev)
 {
-    uint8_t want = !!(dev->regs[0x4f] & 0x80);
+    uint8_t cram = !!(dev->regs[0x4f] & 0x80);
     uint8_t p92  = !!(dev->regs[0x4f] & 0x40);
 
     if (p92 != dev->port_92_decoded) {
@@ -650,30 +650,29 @@ esc_cram_decode(esc_t *dev)
         }
     }
 
-    /* Bit 7 is not acted on, and that is what the book asks for once the
-       register family is read as a whole. PCSA, the register beside this
-       one, says what "disable" means here: "This register is used to
-       enable or disable accesses to the RTC, keyboard controller, Floppy
-       Disk controller, and IDE. Disabling any of these bits will prevent
-       the chip select and X-Bus transceiver control signal (XBUSOE#) for
-       that device from being generated." It withdraws the strobes the ESC
-       drives an external part with, not an address claim. PCSB is the same
-       family -- "enable or disable generation of the X-Bus transceiver
-       signal (XBUSOE#)" -- and bit 7 names the strobes it withdraws,
-       CRAMRD# and CRAMWR#, which the configuration SRAM hangs off along
-       with the CPG[4:0] address lines.
+    /* Bit 7 names the accesses themselves, not the strobes that reach
+       the part behind them: "This bit is used to enable (1) or disable
+       (0) I/O write accesses to location 0C00h and I/O read/write
+       accesses to locations 0800h - 08FFh." Bit 6 just below it is
+       worded the same way for Port 92 and is acted on the same way, so
+       this one is too.
 
-       There is no X-Bus here. The RTC, the keyboard controller, the floppy
-       controller and IDE are all modelled as the devices they are rather
-       than as things the ESC selects, and none of them watch PCSA either;
-       the configuration RAM is storage for the same reason. This board's
-       firmware clears the bit, and on the real machine that stops the ESC
-       strobing an SRAM that answers the bus regardless -- which is why it
-       goes on using the window all through POST, as it does here.
+       Note which accesses that sentence covers. The window goes away in
+       both directions, but of the page register only writes go with it,
+       so CONFRAMP still reads back while the bit is clear.
 
-       Port 92 below is different and is acted on: that one is the ESC's
-       own register, and the book gives it no strobe to withdraw. */
-    (void) want;
+       This board never exercises it. Its BIOS reaches the configuration
+       registers through one pair of helpers -- read at F000:EA2B, write
+       at F000:EA32 -- and the only indices it ever hands them are 40h,
+       42h, 43h and 4Eh. PCSB is not among them, so the register keeps
+       its CFh default and the bit stays set for the life of the
+       machine. */
+    if (cram != dev->cram_decoded) {
+        dev->cram_decoded = cram;
+        esc_log("ESC: configuration RAM %s\n", cram ? "decoded" : "not decoded");
+        io_handler(cram, 0x0800, 0x0100, esc_read, NULL, NULL,
+                   esc_write, NULL, NULL, dev);
+    }
 }
 
 static void
@@ -913,7 +912,10 @@ esc_write(uint16_t port, uint8_t val, void *priv)
             break;
 
         case 0x0c00: /* CONFRAMP, which page of the configuration RAM */
-            dev->cram_page = val & 0x1f;
+            /* The other half of what PCSB bit 7 takes away: writes here
+               go with the window, reads do not. */
+            if (dev->cram_decoded)
+                dev->cram_page = val & 0x1f;
             break;
 
         case 0x0800 ... 0x08ff: /* the configuration RAM itself */
@@ -1027,6 +1029,8 @@ esc_reset_hard(esc_t *dev)
     dma_set_sg_base(0x04);
 
     esc_pirq_update(dev);
+
+    esc_cram_decode(dev);
 
     esc_apic_reset(dev);
     esc_apic_remap(dev);
