@@ -77,7 +77,12 @@ eisa_make_id(uint8_t *id, const char *mfg, uint16_t product, uint8_t revision)
     id[0] = (uint8_t) (packed >> 8);
     id[1] = (uint8_t) (packed & 0xff);
     id[2] = (uint8_t) (product >> 8);
-    id[3] = (uint8_t) ((product & 0xf0) | (revision & 0x0f));
+    /* Three hex digits of product and one of revision, but plenty of IDs
+       are written as a plain four digit number ("ADP0002"), so a revision
+       of zero leaves the low digit of the product alone. */
+    id[3] = (uint8_t) (product & 0xff);
+    if (revision & 0x0f)
+        id[3] = (uint8_t) ((product & 0xf0) | (revision & 0x0f));
 }
 
 /* Every slot is decoded here and handed on, so that a slot nothing lives
