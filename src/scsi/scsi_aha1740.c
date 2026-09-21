@@ -207,13 +207,15 @@ static const uint16_t aha1740_product[4] = { 0x0000, 0x0001, 0x0002, 0x0400 };
 /* The interrupt the card may be configured for, as INTDEF selects it. */
 static const uint8_t aha1740_intab[8] = { 9, 10, 11, 12, 0, 14, 15, 0 };
 
-/* The BIOS address register says where the option ROM answers and whether
-   it answers at all. The configuration utility writes it, so the setting
-   here is only the starting point. */
+/* BIOSADDR (zCC1): the low four bits are BIOSSEL, which picks a sixteen
+   kilobyte boundary, and zero means the BIOS is not mapped at all. Bit 6
+   is RAMEN and bit 7 WRTPRT, which belong to the two kilobytes of overlay
+   RAM at the top of the window and are not modelled. The configuration
+   utility writes this, so what is set up here is only a starting point. */
 static uint32_t
 aha1740_bios_base(const aha1740_t *dev)
 {
-    return 0xc0000 + (((uint32_t) (dev->regs[AHA_BIOSADR] >> 1) & 0x07) << 14);
+    return 0xc0000 + (((uint32_t) dev->regs[AHA_BIOSADR] & 0x0f) << 14);
 }
 
 static void
@@ -222,7 +224,7 @@ aha1740_bios_remap(aha1740_t *dev)
     if (!dev->has_bios)
         return;
 
-    if (dev->regs[AHA_BIOSADR] & 0x01) {
+    if (dev->regs[AHA_BIOSADR] & 0x0f) {
         mem_mapping_set_addr(&dev->bios.mapping, aha1740_bios_base(dev), 0x4000);
         mem_mapping_enable(&dev->bios.mapping);
         aha1740_log("AHA1740: BIOS at %05x\n", aha1740_bios_base(dev));
@@ -716,7 +718,7 @@ aha1740_init(const device_t *info)
 
         if ((fn != NULL) && (fn[0] != '\0')) {
             dev->regs[AHA_BIOSADR] = (uint8_t)
-                (((device_get_config_int("bios_addr") & 0x07) << 1) | 0x01);
+                (device_get_config_int("bios_addr") & 0x0f);
 
             if (rom_init(&dev->bios, fn, aha1740_bios_base(dev), 0x4000,
                          0x3fff, 0, MEM_MAPPING_EXTERNAL) >= 0) {
@@ -780,15 +782,18 @@ static const device_config_t aha1740_config[] = {
         .file_filter    = NULL,
         .spinner        = { 0 },
         .selection      = {
-            { .description = "C0000H", .value = 0 },
-            { .description = "C4000H", .value = 1 },
-            { .description = "C8000H", .value = 2 },
-            { .description = "CC000H", .value = 3 },
-            { .description = "D0000H", .value = 4 },
-            { .description = "D4000H", .value = 5 },
-            { .description = "D8000H", .value = 6 },
-            { .description = "DC000H", .value = 7 },
-            { .description = ""                   }
+            { .description = "C4000H", .value = 1  },
+            { .description = "C8000H", .value = 2  },
+            { .description = "CC000H", .value = 3  },
+            { .description = "D0000H", .value = 4  },
+            { .description = "D4000H", .value = 5  },
+            { .description = "D8000H", .value = 6  },
+            { .description = "DC000H", .value = 7  },
+            { .description = "E0000H", .value = 8  },
+            { .description = "E4000H", .value = 9  },
+            { .description = "E8000H", .value = 10 },
+            { .description = "EC000H", .value = 11 },
+            { .description = ""                    }
         },
         .bios           = { { 0 } }
     },
