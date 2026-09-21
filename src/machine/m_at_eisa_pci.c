@@ -92,7 +92,7 @@ machine_at_54tdp_init(const machine_t *model)
     device_add(&fdc37c669_device);
 
     /* The board identifier the BIOS reads out of the ESC. */
-    esc_set_board_id("AIR", 0x5400, 1);
+    esc_set_board_id("AIR", 0x0901, 0);
 
     /* The Adaptec is not optional on this board: it is soldered to it,
        and the system BIOS carries its option ROM. */
