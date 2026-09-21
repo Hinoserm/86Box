@@ -58,8 +58,6 @@
 #include <86box/esc.h>
 #include <86box/nvr.h>
 #include <86box/machine.h>
-#include <86box/nvr.h>
-#include <86box/machine.h>
 #include <86box/plat_unused.h>
 
 #ifdef ENABLE_ESC_LOG
@@ -102,6 +100,14 @@ typedef struct esc_t {
     uint8_t cram_checked;                         /* the cards have been looked at */
     char    cram_file[128];
 
+    /* The I/O APIC: a select register and a window onto the identifier,
+       the version, the arbitration priority and sixteen redirection
+       entries of two words each. */
+    mem_mapping_t apic_mapping;
+    uint32_t      apic_sel;
+    uint32_t      apic_id;
+    uint32_t      apic_redir[16][2];
+
     port_92_t *port_92;
 } esc_t;
 
@@ -112,6 +118,184 @@ typedef struct pceb_t {
 } pceb_t;
 
 static esc_t *esc_inst = NULL;
+
+/* ------------------------------------------------------------------ */
+/* PCI interrupt steering                                              */
+/* ------------------------------------------------------------------ */
+
+/* A PIRQ reaches an IRQ only when its own route register says so and the
+   mode select register has the PIRQ pins switched on at all: bit 6 there
+   is what makes them PIRQs rather than MREQs. */
+static void
+esc_pirq_update(esc_t *dev)
+{
+    for (uint8_t i = 0; i < 4; i++) {
+        uint8_t route = dev->regs[0x60 + i];
+
+        if ((dev->regs[0x40] & 0x40) && !(route & 0x80))
+            pci_set_irq_routing(PCI_INTA + i, route & 0x0f);
+        else
+            pci_set_irq_routing(PCI_INTA + i, PCI_IRQ_DISABLED);
+    }
+}
+
+/* ------------------------------------------------------------------ */
+/* The I/O APIC                                                        */
+/* ------------------------------------------------------------------ */
+
+/* The register file is all here and behaves as the data book says. What
+   is not here is anywhere for a message to go: the emulator has no local
+   APIC and no APIC bus, so an unmasked entry is remembered and nothing
+   more. A machine with one processor runs through the 8259s, which is
+   what INTRC = 0 in the PAC register means, and never notices. */
+#define ESC_APIC_VER      0x000f0011
+#define ESC_APIC_LO_MASK  0x0001afff /* bits 12 and 14 are the chip's */
+#define ESC_APIC_HI_MASK  0xff000000
+
+static uint32_t
+esc_apic_reg_read(esc_t *dev)
+{
+    uint8_t reg = dev->apic_sel & 0xff;
+
+    switch (reg) {
+        case 0x00: /* APICID */
+        case 0x02: /* APICARB, which a write to the identifier also loads */
+            return dev->apic_id;
+
+        case 0x01: /* APICVER */
+            return ESC_APIC_VER;
+
+        case 0x10 ... 0x2f:
+            return dev->apic_redir[(reg - 0x10) >> 1][reg & 1];
+
+        default:
+            break;
+    }
+
+    return 0x00000000;
+}
+
+static void
+esc_apic_reg_write(esc_t *dev, uint32_t val)
+{
+    uint8_t reg = dev->apic_sel & 0xff;
+
+    switch (reg) {
+        case 0x00:
+            dev->apic_id = val & 0x0f000000;
+            break;
+
+        case 0x10 ... 0x2f:
+            if (reg & 1)
+                dev->apic_redir[(reg - 0x10) >> 1][1] = val & ESC_APIC_HI_MASK;
+            else {
+                uint32_t *lo = &dev->apic_redir[(reg - 0x10) >> 1][0];
+
+                *lo = (*lo & ~ESC_APIC_LO_MASK) | (val & ESC_APIC_LO_MASK);
+                esc_log("ESC: I/O APIC entry %i = %08x%s\n", (reg - 0x10) >> 1,
+                        *lo, (*lo & 0x00010000) ? "" : " (unmasked, and no "
+                        "local APIC to take it)");
+            }
+            break;
+
+        default:
+            break;
+    }
+}
+
+static uint32_t
+esc_apic_readl(uint32_t addr, void *priv)
+{
+    esc_t *dev = (esc_t *) priv;
+
+    switch (addr & 0x3fc) {
+        case 0x000:
+            return dev->apic_sel;
+        case 0x010:
+            return esc_apic_reg_read(dev);
+        default:
+            break;
+    }
+
+    return 0xffffffff;
+}
+
+static void
+esc_apic_writel(uint32_t addr, uint32_t val, void *priv)
+{
+    esc_t *dev = (esc_t *) priv;
+
+    switch (addr & 0x3fc) {
+        case 0x000:
+            dev->apic_sel = val & 0x000000ff;
+            break;
+        case 0x010:
+            esc_apic_reg_write(dev, val);
+            break;
+        default:
+            break;
+    }
+}
+
+/* Software is told to use doubleword accesses. Narrower ones are put
+   together from those rather than refused. */
+static uint8_t
+esc_apic_readb(uint32_t addr, void *priv)
+{
+    return (uint8_t) (esc_apic_readl(addr, priv) >> ((addr & 3) * 8));
+}
+
+static uint16_t
+esc_apic_readw(uint32_t addr, void *priv)
+{
+    return (uint16_t) (esc_apic_readl(addr, priv) >> ((addr & 2) * 8));
+}
+
+static void
+esc_apic_writeb(uint32_t addr, uint8_t val, void *priv)
+{
+    uint32_t cur   = esc_apic_readl(addr, priv);
+    int      shift = (addr & 3) * 8;
+
+    cur = (cur & ~(0xffU << shift)) | ((uint32_t) val << shift);
+    esc_apic_writel(addr, cur, priv);
+}
+
+static void
+esc_apic_writew(uint32_t addr, uint16_t val, void *priv)
+{
+    uint32_t cur   = esc_apic_readl(addr, priv);
+    int      shift = (addr & 2) * 8;
+
+    cur = (cur & ~(0xffffU << shift)) | ((uint32_t) val << shift);
+    esc_apic_writel(addr, cur, priv);
+}
+
+/* APICBASE moves the unit in 1 KB steps: bits 5:2 are address bits 15:12
+   and, on the SB part, bits 1:0 are address bits 11:10. */
+static void
+esc_apic_remap(esc_t *dev)
+{
+    uint32_t base = 0xfec00000 |
+                    (((uint32_t) (dev->regs[0x59] >> 2) & 0x0f) << 12) |
+                    (((uint32_t) dev->regs[0x59] & 0x03) << 10);
+
+    mem_mapping_set_addr(&dev->apic_mapping, base, 0x400);
+    esc_log("ESC: I/O APIC at %08x\n", base);
+}
+
+static void
+esc_apic_reset(esc_t *dev)
+{
+    dev->apic_sel = 0x00000000;
+    dev->apic_id  = 0x00000000;
+
+    /* Every pin starts masked. */
+    for (uint8_t i = 0; i < 16; i++) {
+        dev->apic_redir[i][0] = 0x00010000;
+        dev->apic_redir[i][1] = 0x00000000;
+    }
+}
 
 /* ------------------------------------------------------------------ */
 /* The EISA configuration RAM                                          */
@@ -323,7 +507,10 @@ esc_conf_write(esc_t *dev, uint8_t index, uint8_t val)
             /* Bits 1:0 choose how many slots the part decodes for, which
                is what decides whether the address enables are direct or
                encoded. Everything here is the direct four slot case. */
-            dev->regs[0x40] = val;
+            dev->regs[0x40] = val & 0x7f;
+            esc_log("ESC: mode select %02x, PIRQs %s\n", val,
+                    (val & 0x40) ? "on" : "off");
+            esc_pirq_update(dev);
             break;
 
         case 0x42: /* BIOSCSA */
@@ -356,7 +543,8 @@ esc_conf_write(esc_t *dev, uint8_t index, uint8_t val)
             break;
 
         case 0x59: /* APICBA */
-            dev->regs[0x59] = val & 0xfc;
+            dev->regs[0x59] = val & 0x3f;
+            esc_apic_remap(dev);
             break;
 
         case 0x60: /* PIRQRC0..3 */
@@ -364,10 +552,7 @@ esc_conf_write(esc_t *dev, uint8_t index, uint8_t val)
         case 0x62:
         case 0x63:
             dev->regs[index] = val & 0x8f;
-            if (val & 0x80)
-                pci_set_irq_routing(PCI_INTA + (index & 0x03), PCI_IRQ_DISABLED);
-            else
-                pci_set_irq_routing(PCI_INTA + (index & 0x03), val & 0x0f);
+            esc_pirq_update(dev);
             esc_log("ESC: PIRQ %c -> %02x\n", 'A' + (index & 3), val);
             break;
 
@@ -387,8 +572,8 @@ esc_conf_write(esc_t *dev, uint8_t index, uint8_t val)
             dev->regs[index] = val;
             break;
 
-        case 0x70: /* PACC, PIC/APIC configuration control */
-            dev->regs[0x70] = val & 0x1f;
+        case 0x70: /* PAC, PCI/APIC control: INTR and SMI routing */
+            dev->regs[0x70] = val & 0x03;
             break;
 
         case 0x88: /* TSTC, test control */
@@ -560,7 +745,7 @@ esc_read(uint16_t port, void *priv)
             return dev->cram_page;
 
         case 0x0800 ... 0x08ff:
-            esc_cram_verify(dev);
+            esc_cram_verify((esc_t *) dev);
             esc_log("ESC: cram rd %02x:%02x = %02x\n", dev->cram_page,
                     port & 0xff,
                     dev->cram[(dev->cram_page * 256) + (port & 0xff)]);
@@ -607,10 +792,10 @@ esc_reset_hard(esc_t *dev)
     dma_remove_sg();
     dma_set_sg_base(0x04);
 
-    pci_set_irq_routing(PCI_INTA, PCI_IRQ_DISABLED);
-    pci_set_irq_routing(PCI_INTB, PCI_IRQ_DISABLED);
-    pci_set_irq_routing(PCI_INTC, PCI_IRQ_DISABLED);
-    pci_set_irq_routing(PCI_INTD, PCI_IRQ_DISABLED);
+    esc_pirq_update(dev);
+
+    esc_apic_reset(dev);
+    esc_apic_remap(dev);
 
     eisa_reset();
 }
@@ -672,6 +857,11 @@ esc_init(UNUSED(const device_t *info))
                   dev);
     io_sethandler(0x0c00, 0x0001, esc_read, NULL, NULL, esc_write, NULL, NULL,
                   dev);
+
+    mem_mapping_add(&dev->apic_mapping, 0xfec00000, 0x400,
+                    esc_apic_readb, esc_apic_readw, esc_apic_readl,
+                    esc_apic_writeb, esc_apic_writew, esc_apic_writel,
+                    NULL, MEM_MAPPING_EXTERNAL, dev);
 
     dev->cram_auto = (uint8_t) device_get_config_int("cram_auto");
     snprintf(dev->cram_file, sizeof(dev->cram_file), "%s_eisa.nvr",
