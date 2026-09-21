@@ -379,6 +379,7 @@ typedef struct aic_chip_t {
     uint8_t     fifo_addr_hi;  /* a second byte of data FIFO address */
     uint8_t     selid_writable;/* SELID is read only on the older part */
     uint8_t     twin_capable;  /* a second SCSI channel to strap */
+    uint8_t     seqctl_reset;  /* what SEQCTL comes up holding */
 } aic_chip_t;
 
 /* The AIC-7770. Four SCB pages and two four deep queues; SCBPTR keeps
@@ -402,6 +403,10 @@ static const aic_chip_t aic_chip_7770 = {
     .fifo_addr_hi  = 0,
     .selid_writable = 0,
     .twin_capable  = 1,
+    /* PERRORDIS is the one bit here whose reset value the data book gives
+       as a one; FASTMODE is not, so the sequencer starts on the slower of
+       its two clocks until the firmware asks for the other. */
+    .seqctl_reset  = PERRORDIS,
 };
 
 /* The AIC-7870 and AIC-7880, which keep everything the older part had and
@@ -421,6 +426,7 @@ static const aic_chip_t aic_chip_788x = {
     .fifo_addr_hi  = 1,
     .selid_writable = 1,
     .twin_capable  = 0,
+    .seqctl_reset  = PERRORDIS | FASTMODE,
 };
 
 /* PCI configuration, device specific. */
@@ -624,12 +630,10 @@ typedef struct aic7xxx_t {
     pc_timer_t seq_timer;
     pc_timer_t sel_timer;
     pc_timer_t tgt_timer;
-    pc_timer_t busfree_timer;
 } aic7xxx_t;
 
 static void aic_update_irq(aic7xxx_t *dev);
 static void aic_seq_kick(aic7xxx_t *dev);
-static void aic_busfree_check(aic7xxx_t *dev);
 static void aic_seq_run(aic7xxx_t *dev);
 static void aic_pump(aic7xxx_t *dev);
 static void aic_bus_free(aic7xxx_t *dev);
@@ -808,8 +812,6 @@ aic_bus_changed(aic7xxx_t *dev)
     /* A byte already waiting in the PIO latch goes out on this REQ. */
     aic_pio_out(dev);
 
-    aic_busfree_check(dev);
-
     dev->asleep = 0;
     aic_seq_kick(dev);
 }
@@ -833,6 +835,7 @@ aic_bus_free(aic7xxx_t *dev)
     dev->msgin_len = dev->msgin_pos = 0;
     dev->msgout_len                 = 0;
     timer_stop(&dev->tgt_timer);
+    aic_set_sstat1(dev, BUSFREE);
     aic_bus_changed(dev);
 }
 
@@ -1131,36 +1134,6 @@ aic_tgt_next(aic7xxx_t *dev)
     aic_bus_changed(dev);
 }
 
-/* BUSFREE is not an edge. The data book has it set "when the BSY and SEL
-   signals have been negated on the SCSI bus for 400ns", and reflecting the
-   state of the bus rather than one transition on it -- so a selection that
-   simply ran out, having never made the bus busy, still ends with the bus
-   free and the latch set. The delay is the whole of it: latching the
-   moment the bus looks idle fires while a selection is being set up and
-   drowns the firmware in bus-free interrupts. */
-static void
-aic_busfree_timer(void *priv)
-{
-    aic7xxx_t *dev = (aic7xxx_t *) priv;
-
-    aic_set_sstat1(dev, BUSFREE);
-    aic_seq_kick(dev);
-}
-
-static void
-aic_busfree_check(aic7xxx_t *dev)
-{
-    const int idle = (dev->bus_state == BUS_FREE) && !dev->selecting &&
-                     !(dev->scsisigo & (SELI | BSYI));
-
-    if (!idle) {
-        timer_stop(&dev->busfree_timer);
-        return;
-    }
-    if (!(dev->sstat1 & BUSFREE) && !timer_is_on(&dev->busfree_timer))
-        timer_on_auto(&dev->busfree_timer, 0.4);
-}
-
 static void
 aic_tgt_timer(void *priv)
 {
@@ -1409,12 +1382,6 @@ aic_select_done(void *priv)
 
     if ((sd == NULL) || !scsi_device_present(sd)) {
         aic_log("select %i: timeout\n", id);
-        /* The bus is free again the moment SEL is dropped, and BUSFREE
-           "will reflect the state of the SCSI bus" -- a selection that
-           ran out never made it busy, so nothing else would have said so.
-           Latching it only here, rather than on every look at an idle
-           bus, is the 400ns the data book asks for that this model has no
-           clock to count. */
         aic_set_sstat1(dev, SELTO);
         aic_bus_changed(dev);
         return;
@@ -1505,7 +1472,6 @@ aic_scsi_reset_bus(aic7xxx_t *dev)
     dev->sstat0 &= ~(SELDO | SELDI | SELINGO);
     timer_stop(&dev->sel_timer);
     timer_stop(&dev->tgt_timer);
-    timer_stop(&dev->busfree_timer);
 
     for (uint8_t i = 0; i < (dev->wide ? 16 : 8); i++)
         scsi_device_reset(&scsi_devices[dev->bus][i]);
@@ -2339,8 +2305,6 @@ aic_write(aic7xxx_t *dev, uint8_t addr, uint8_t val, int seq)
                 dev->atn = 0;
                 dev->scsisigo &= ~0x10;
             }
-            /* Cleared while the bus is still free, it comes back after
-               another 400ns, because the bus is still free. */
             aic_bus_changed(dev);
             break;
         case SIMODE0:
@@ -3169,10 +3133,7 @@ aic_chip_reset(aic7xxx_t *dev)
     dev->seq_idle   = 1;
     dev->seq_credit = 0.0;
 
-    /* PERRORDIS is the one bit here whose reset value is a one; FASTMODE
-       is not, so the sequencer starts on the slower of its two clocks
-       until the firmware asks for the other. */
-    dev->seqctl   = PERRORDIS;
+    dev->seqctl   = dev->chip->seqctl_reset;
     dev->pc       = 0;
     dev->ram_byte = 0;
     dev->accum = dev->sindex = dev->dindex = 0;
@@ -3953,7 +3914,6 @@ aic_init(const device_t *info)
     timer_add(&dev->seq_timer, aic_seq_timer, dev, 0);
     timer_add(&dev->sel_timer, aic_select_done, dev, 0);
     timer_add(&dev->tgt_timer, aic_tgt_timer, dev, 0);
-    timer_add(&dev->busfree_timer, aic_busfree_timer, dev, 0);
 
     aic_chip_reset(dev);
 
