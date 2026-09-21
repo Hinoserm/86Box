@@ -2903,6 +2903,24 @@ aic_write(aic7xxx_t *dev, uint8_t addr, uint8_t val, int seq)
  * compare opcodes -- which is why the assembler refuses a literal zero
  * there and makes you write A. The jump opcodes take it literally, since
  * they use it to pass a constant to the code they jump to.
+ *
+ * That layout is not taken on trust. The AHA-2740's own option ROM
+ * carries the program it downloads, assembled for this exact part, and
+ * decoding it here is a test this could fail: at offset 384Ch there are
+ * 349 instructions, ending where the next instruction's top byte reads
+ * FFh rather than an opcode.
+ *
+ *   - every one of the 349 decodes to a defined opcode. A misplaced
+ *     opcode field would strew opcode 7 and the other unassigned ones
+ *     through the program;
+ *   - 166 of the 168 branches land inside it, and the two that do not
+ *     are both to 349 exactly, one past the last instruction. A
+ *     misplaced address field would scatter targets over the whole 512
+ *     the nine bits can reach, and about a third would overshoot;
+ *   - and BMOV never appears, which is what this part should look like:
+ *     the block move arrived with the command channel, and a 7770 has
+ *     none. The driver's own loader knows it, rewriting BMOV for parts
+ *     without AHC_CMD_CHAN.
  */
 
 #define OP_OR   0x0
