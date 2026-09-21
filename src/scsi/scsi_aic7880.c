@@ -3021,7 +3021,8 @@ aic_seeprom_build(const aic7880_t *dev, uint16_t *nvr)
 static void
 aic_eisa_bios(aic7880_t *dev, const device_t *info)
 {
-    const char *fn = device_get_config_string("bios_fn");
+    const char *rev = device_get_config_bios("bios_rev");
+    const char *fn  = device_get_bios_file(info, rev, 0);
     uint32_t    base;
     uint32_t    size;
     FILE       *fp;
@@ -3365,6 +3366,7 @@ aic_pci_write(int func, int addr, UNUSED(int len), uint8_t val, void *priv)
 #define AHA2940UW_V125_ROM "roms/scsi/adaptec/aha2940uw_v125.bin"
 #define AHA2940UW_V134_ROM "roms/scsi/adaptec/aha2940uw_v134.bin"
 #define AHA2940UW_V220_ROM "roms/scsi/adaptec/aha2940uw_v220.bin"
+#define AHA2740_V210_ROM   "roms/scsi/adaptec/aha2740_v210.bin"
 
 #define BOARD_7880         0 /* the chip on a motherboard */
 #define BOARD_2940U        1 /* AHA-2940 Ultra, narrow */
@@ -3574,15 +3576,25 @@ static const device_config_t aic7770_config[] = {
         .bios           = { { 0 } }
     },
     {
-        .name           = "bios_fn",
-        .description    = "BIOS image",
-        .type           = CONFIG_FNAME,
-        .default_string = "",
+        .name           = "bios_rev",
+        .description    = "BIOS Revision",
+        .type           = CONFIG_BIOS,
+        .default_string = "v2_10",
         .default_int    = 0,
-        .file_filter    = "BIOS images (*.bin *.rom)|*.bin;*.rom|All files (*.*)|*.*",
+        .file_filter    = NULL,
         .spinner        = { 0 },
-        .selection      = { { 0 } },
-        .bios           = { { 0 } }
+        .bios           = {
+            {
+                .name          = "Version 2.10",
+                .internal_name = "v2_10",
+                .bios_type     = BIOS_NORMAL,
+                .files_no      = 1,
+                .local         = 0,
+                .size          = 16384,
+                .files         = { AHA2740_V210_ROM, "" }
+            },
+            { .files_no = 0 }
+        }
     },
     {
         .name           = "bios_addr",

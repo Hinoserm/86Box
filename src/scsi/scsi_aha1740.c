@@ -48,6 +48,8 @@
 #include <86box/scsi.h>
 #include <86box/scsi_device.h>
 #include <86box/rom.h>
+
+#define AHA1740_V140_ROM "roms/scsi/adaptec/aha1740_v140.bin"
 #include <86box/scsi_aha1740.h>
 #include <86box/plat_unused.h>
 
@@ -714,7 +716,8 @@ aha1740_init(const device_t *info)
        no canonical dump of these in the ROM set, so the image is named by
        the user rather than picked from a list. */
     if (device_get_config_int("bios")) {
-        const char *fn = device_get_config_string("bios_fn");
+        const char *rev = device_get_config_bios("bios_rev");
+        const char *fn  = device_get_bios_file(info, rev, 0);
 
         if ((fn != NULL) && (fn[0] != '\0')) {
             dev->regs[AHA_BIOSADR] = (uint8_t)
@@ -763,15 +766,25 @@ static const device_config_t aha1740_config[] = {
         .bios           = { { 0 } }
     },
     {
-        .name           = "bios_fn",
-        .description    = "BIOS image",
-        .type           = CONFIG_FNAME,
-        .default_string = "",
+        .name           = "bios_rev",
+        .description    = "BIOS Revision",
+        .type           = CONFIG_BIOS,
+        .default_string = "v1_40",
         .default_int    = 0,
-        .file_filter    = "BIOS images (*.bin *.rom)|*.bin;*.rom|All files (*.*)|*.*",
+        .file_filter    = NULL,
         .spinner        = { 0 },
-        .selection      = { { 0 } },
-        .bios           = { { 0 } }
+        .bios           = {
+            {
+                .name          = "Version 1.40",
+                .internal_name = "v1_40",
+                .bios_type     = BIOS_NORMAL,
+                .files_no      = 1,
+                .local         = 0,
+                .size          = 16384,
+                .files         = { AHA1740_V140_ROM, "" }
+            },
+            { .files_no = 0 }
+        }
     },
     {
         .name           = "bios_addr",
