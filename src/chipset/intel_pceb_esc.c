@@ -473,6 +473,8 @@ esc_write(uint16_t port, uint8_t val, void *priv)
             break;
 
         case 0x0800 ... 0x08ff: /* the configuration RAM itself */
+            esc_log("ESC: cram wr %02x:%02x = %02x\n", dev->cram_page,
+                    port & 0xff, val);
             dev->cram[(dev->cram_page * 256) + (port & 0xff)] = val;
             break;
 
@@ -505,6 +507,9 @@ esc_read(uint16_t port, void *priv)
             return dev->cram_page;
 
         case 0x0800 ... 0x08ff:
+            esc_log("ESC: cram rd %02x:%02x = %02x\n", dev->cram_page,
+                    port & 0xff,
+                    dev->cram[(dev->cram_page * 256) + (port & 0xff)]);
             return dev->cram[(dev->cram_page * 256) + (port & 0xff)];
 
         case 0x0464:
@@ -592,6 +597,7 @@ esc_init(UNUSED(const device_t *info))
     /* Two interrupt controllers whose trigger can be chosen per line,
        which is what EISA needs and what ISA never had. */
     pic_elcr_set_enabled(1);
+    pic_elcr_io_handler(1);
 
     /* A second timer: counter 0 is the fail-safe timer that can raise
        NMI, counter 2 drives CPU speed control. */
@@ -830,7 +836,7 @@ pceb_init(UNUSED(const device_t *info))
 
     pceb_reset_hard(dev);
 
-    pci_add_card(PCI_ADD_NORMAL, pceb_read, pceb_write, dev, &dev->pci_slot);
+    pci_add_card(PCI_ADD_SOUTHBRIDGE, pceb_read, pceb_write, dev, &dev->pci_slot);
 
     return dev;
 }

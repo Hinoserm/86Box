@@ -213,6 +213,10 @@ extern const device_t keyboard_at_generic_device;
 #endif /*EMU_DEVICE_H*/
 
 extern void     keyboard_toggle_override(void);
+#ifdef EMU_DEVICE_H
+extern const device_t kbd_pipe_device;
+#endif
+
 extern void     keyboard_init(void);
 extern void     keyboard_close(void);
 extern void     keyboard_set_table(const scancode *ptr);

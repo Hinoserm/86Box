@@ -73,6 +73,9 @@ machine_at_common_init(const machine_t *model)
     if (model->init != machine_at_m290_init)
         device_add(&port_6x_device);
 
+    /* A way in for keystrokes that does not need a window to focus. */
+    device_add(&kbd_pipe_device);
+
     standalone_gameport_type = &gameport_device;
 }
 

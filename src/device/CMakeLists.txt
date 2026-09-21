@@ -46,6 +46,7 @@ add_library(dev OBJECT
     kbc_at_dev.c
     kbc_ps2_m25.c
     kbc_xt.c
+    kbd_pipe.c
     keyboard.c
     keyboard_at.c
     keyboard_xt.c
