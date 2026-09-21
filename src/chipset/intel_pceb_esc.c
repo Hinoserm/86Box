@@ -92,6 +92,7 @@ typedef struct esc_t {
     uint8_t port_92_decoded;
 
     uint8_t board_id[4];
+    uint8_t strap_id[4];    /* what the board itself identifies as */
     uint8_t embedded_id[4]; /* a device soldered to the board */
 
     /* The EISA configuration RAM: thirty-two pages of two hundred and
@@ -619,9 +620,33 @@ esc_set_board_id(const char *mfg, uint16_t product, uint8_t rev)
 
     eisa_make_id(id, mfg, product, rev);
 
-    /* What the board is, for anything walking the slots. The chip's own
-       identifier registers are not set from here: the firmware writes
-       those, as it does on the real machine. */
+    /* What the board is, for anything walking the slots, and what the
+       identifier registers come up holding.
+
+       The book has them start at zero -- "On power up these bits default
+       to 00h. These bit are written with the ID value during
+       configuration" -- and that is what this used to do. It is wrong for
+       this machine. Its BIOS reaches the configuration registers through
+       exactly one pair of helpers, read at F000:EA2B and write at
+       F000:EA32, and every call site in the ROM is accounted for: six
+       writes, carrying indices 40h, 42h, 43h, 43h, 40h and 4Eh. EISAID is
+       not among them, and neither the packed identifier nor any inline
+       write to 0022h/0023h appears anywhere else in the image. This
+       firmware never writes these registers at all, so left at zero they
+       stay at zero and 0C80h-0C83h answer a system board with no identity
+       for the whole life of the machine.
+
+       A board that does not program its own identifier has it strapped,
+       which is what this models: the registers still read and write as
+       the book describes, they simply come up holding the board's own
+       identifier rather than nothing. */
+    if (esc_inst != NULL) {
+        memcpy(esc_inst->strap_id, id, 4);
+        memcpy(esc_inst->board_id, id, 4);
+        for (uint8_t i = 0; i < 4; i++)
+            esc_inst->regs[0x50 + i] = id[i];
+    }
+
     eisa_set_board_id(id);
 }
 
@@ -1016,14 +1041,16 @@ esc_reset_hard(esc_t *dev)
     dev->nmi_esc  = 0x00;
     dev->last_mst = 0x00;
 
-    /* EISAID1..4 are zero out of reset and the firmware writes the
-       identifier in during configuration, which is what 0C80h-0C83h then
-       answer with. This board's does: it writes 05 32 09 01, "AIR0901",
-       which is what esc_set_board_id would have put there anyway. */
+    /* EISAID1..4, which 0C80h-0C83h answer from. The book starts them at
+       zero for firmware to fill in during configuration; this board's
+       firmware never writes them, so what comes back is what the board
+       straps -- see esc_set_board_id. Before the machine has said what it
+       is, that is still zero. */
     for (uint8_t i = 0; i < 4; i++) {
-        dev->regs[0x50 + i] = 0x00;
-        dev->board_id[i]    = 0x00;
+        dev->regs[0x50 + i] = dev->strap_id[i];
+        dev->board_id[i]    = dev->strap_id[i];
     }
+    eisa_set_board_id(dev->board_id);
 
     dma_remove_sg();
     dma_set_sg_base(0x04);
