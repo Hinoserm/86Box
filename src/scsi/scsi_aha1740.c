@@ -193,6 +193,7 @@ typedef struct aha1740_t {
     /* The last two kilobytes of the window are RAM the firmware keeps its
        working copy in, overlaying the ROM underneath. */
     uint8_t bios_ram[2048];
+    uint8_t bios_rom_top[2048]; /* what the ROM has underneath it */
 
     pc_timer_t timer;
     uint32_t   pending_ecb;
@@ -222,16 +223,27 @@ static const uint8_t aha1740_intab[8] = { 9, 10, 11, 12, 0, 14, 15, 0 };
 #define AHA_BIOS_WRTPRT 0x80
 #define AHA_BIOS_RAMOFF 0x3800
 
+/* Put whichever of the two is showing into the image the rest of the
+   emulator reads, so that the processor fetching code and a bus master
+   fetching a command block both see the same thing. */
+static void
+aha1740_bios_overlay(aha1740_t *dev)
+{
+    if (!dev->has_bios)
+        return;
+
+    memcpy(&dev->bios.rom[AHA_BIOS_RAMOFF],
+           (dev->regs[AHA_BIOSADR] & AHA_BIOS_RAMEN) ? dev->bios_ram
+                                                     : dev->bios_rom_top,
+           sizeof(dev->bios_ram));
+}
+
 static uint8_t
 aha1740_bios_read(uint32_t addr, void *priv)
 {
     const aha1740_t *dev = (const aha1740_t *) priv;
-    uint32_t         off = addr & 0x3fff;
 
-    if ((off >= AHA_BIOS_RAMOFF) && (dev->regs[AHA_BIOSADR] & AHA_BIOS_RAMEN))
-        return dev->bios_ram[off - AHA_BIOS_RAMOFF];
-
-    return dev->bios.rom[off & dev->bios.mask];
+    return dev->bios.rom[(addr & 0x3fff) & dev->bios.mask];
 }
 
 static void
@@ -240,8 +252,12 @@ aha1740_bios_write(uint32_t addr, uint8_t val, void *priv)
     aha1740_t *dev = (aha1740_t *) priv;
     uint32_t   off = addr & 0x3fff;
 
-    if ((off >= AHA_BIOS_RAMOFF) && !(dev->regs[AHA_BIOSADR] & AHA_BIOS_WRTPRT))
-        dev->bios_ram[off - AHA_BIOS_RAMOFF] = val;
+    if ((off < AHA_BIOS_RAMOFF) || (dev->regs[AHA_BIOSADR] & AHA_BIOS_WRTPRT))
+        return;
+
+    dev->bios_ram[off - AHA_BIOS_RAMOFF] = val;
+    if (dev->regs[AHA_BIOSADR] & AHA_BIOS_RAMEN)
+        dev->bios.rom[off] = val;
 }
 
 static uint16_t
@@ -690,6 +706,7 @@ aha1740_write(uint16_t port, uint8_t val, void *priv)
 
         case AHA_BIOSADR:
             dev->regs[off] = val;
+            aha1740_bios_overlay(dev);
             aha1740_bios_remap(dev);
             break;
 
@@ -794,6 +811,8 @@ aha1740_init(const device_t *info)
                                         aha1740_bios_readl, aha1740_bios_write,
                                         aha1740_bios_writew, aha1740_bios_writel);
                 mem_mapping_set_p(&dev->bios.mapping, dev);
+                memcpy(dev->bios_rom_top, &dev->bios.rom[AHA_BIOS_RAMOFF],
+                       sizeof(dev->bios_rom_top));
                 aha1740_bios_remap(dev);
             } else
                 aha1740_log("AHA1740: could not read %s\n", fn);
