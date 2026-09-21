@@ -772,6 +772,30 @@ esc_conf_write(esc_t *dev, uint8_t index, uint8_t val)
 
         case 0x42: /* BIOSCSA */
         case 0x43: /* BIOSCSB */
+            /* Which BIOS ranges the part answers for, and whether it
+               answers writes as well as reads: "if the range has been
+               enabled the LBIOSCS# signal is always asserted for memory
+               reads in the enabled BIOS range. If the BIOS Write Enable
+               bit is set in the configuration register BIOSCSB, the
+               LBIOSCS# is also asserted for memory write cycles."
+
+               This board's firmware uses that write enable properly --
+               F000:E8C7 sets BIOSCSB bit 3 and F000:E8E7 clears it again,
+               around whatever it means to store -- so honouring it would
+               keep stray writes off the flash that backs 54tdp.bin.
+
+               It cannot be held here. LBIOSCS# is the bus side of a pair:
+               the north bridge's PAM decides whether the processor's
+               access leaves for the bus at all, and only then does this
+               part select the BIOS. 86Box does model those two sides
+               separately, but the 430HX sets them together -- every PAM
+               write goes through mem_set_mem_state_both(), which is
+               ACCESS_ALL and takes the bus side with it. A gate set from
+               here survives until the next PAM write and no longer, so
+               the two would fight rather than compose. The register reads
+               and writes as the book describes; the protection is the
+               north bridge's, as it is for every other machine of this
+               generation. */
             dev->regs[index] = val;
             break;
 
