@@ -96,9 +96,7 @@ typedef struct esc_t {
        every power on, so it has to outlive the machine. */
     uint8_t cram[ESC_CRAM_PAGES * 256];
     uint8_t cram_page;
-    uint8_t cram_auto; /* rebuild it when the cards change */
-    uint8_t cram_sig[(EISA_MAX_SLOTS + 1) * 4];   /* what the file was written for */
-    uint8_t cram_checked;                         /* the cards have been looked at */
+    uint8_t cram_auto; /* start an empty store when there is none */
     char    cram_file[128];
 
     /* The I/O APIC: a select register and a window onto the identifier,
@@ -328,31 +326,10 @@ esc_apic_reset(esc_t *dev)
 /* The EISA configuration RAM                                          */
 /* ------------------------------------------------------------------ */
 
-/* A configuration record as the utility and the BIOS both understand it:
-   the four identifier bytes, a byte saying the slot is in use and what
-   kind of board it is, and then the function records. Firmware checks
-   the identifier against what the slot actually answers, which is why
-   generating this from the machine rather than from a file is safe --
-   the two cannot disagree. This is only the starting point: once the
-   BIOS or the utility has written the store, what they wrote is kept. */
-static void
-esc_cram_checksum(uint8_t *page)
-{
-    uint16_t sum = 0;
-    uint8_t  csum = 0;
-
-    /* The sum over the record, excluding the two checksum bytes, is what
-       the BIOS compares against. */
-    page[2] = page[3] = 0;
-    for (uint16_t i = 0; i < 256; i++)
-        sum = (uint16_t) (sum + page[i]);
-    sum     = (uint16_t) (0 - sum);
-    page[2] = (uint8_t) (sum & 0xff);
-    page[3] = (uint8_t) (sum >> 8);
-}
-
-/* Build the configuration from the machine as it stands. Slot zero is the
-   board itself; the rest are whatever answered when the bus was walked. */
+/* An empty store, laid out the way the board's own firmware lays one out
+   when it finds nothing worth keeping. It holds no configuration: that is
+   the utility's to write, and until it has, every slot reads back as not
+   configured. */
 static void
 esc_cram_generate(esc_t *dev)
 {
@@ -415,62 +392,14 @@ esc_cram_generate(esc_t *dev)
     memcpy(&c[0x2f], dev->embedded_id, 4);
     c[0x33] = 0x50;
 
-    /* A configuration record for the board and for every slot with a
-       board in it. The table of offsets at block+0Eh is indexed by the
-       slot number itself -- the firmware's "read slot configuration"
-       takes the slot in CL and goes straight to the entry -- and it
-       refuses any slot not below the count at block+0Ch. So slot zero,
-       the board, comes first, and the count runs to the last one filled.
-
-       Each record is eight bytes of header, being its length, the slot
-       it describes and the four identifier bytes, followed by a chain of
-       function blocks each starting with its own length. A zero length
-       ends the chain, which is what a board with nothing to allocate
-       looks like. They grow upward from block+FCh, which is where
-       block+0Ah points and what block+06h counts down from. */
-    {
-        uint16_t at    = ESC_CRAM_RECS;
-        uint16_t free  = 0x1eb4;
-        uint8_t  count = 0;
-
-        for (uint8_t slot = 0; slot <= EISA_MAX_SLOTS; slot++) {
-            uint8_t *r;
-            uint8_t  id[4];
-
-            if (slot == 0)
-                memcpy(id, dev->board_id, 4);
-            else if (eisa_slot_occupied(slot)) {
-                for (uint8_t i = 0; i < 4; i++)
-                    id[i] = eisa_slot_id(slot, i);
-            } else
-                continue;
-
-            if (free < (ESC_CRAM_RECLEN + 4))
-                break;
-
-            r    = &c[ESC_CRAM_BASE + at];
-            r[0] = ESC_CRAM_RECLEN + 4;
-            r[1] = 0x00;
-            r[2] = slot;
-            r[3] = 0x00;
-            memcpy(&r[4], id, 4);
-            r[8] = 0x00;
-            r[9] = 0x00;
-
-            c[ESC_CRAM_BASE + 0x0e + (slot * 2)]     = (uint8_t) (at & 0xff);
-            c[ESC_CRAM_BASE + 0x0e + (slot * 2) + 1] = (uint8_t) (at >> 8);
-
-            at    = (uint16_t) (at + ESC_CRAM_RECLEN + 4);
-            free  = (uint16_t) (free - (ESC_CRAM_RECLEN + 4));
-            count = (uint8_t) (slot + 1);
-        }
-
-        c[ESC_CRAM_BASE + 0x0c] = count;
-        c[ESC_CRAM_BASE + 0x0a] = (uint8_t) (at & 0xff);
-        c[ESC_CRAM_BASE + 0x0b] = (uint8_t) (at >> 8);
-        c[ESC_CRAM_BASE + 0x06] = (uint8_t) (free & 0xff);
-        c[ESC_CRAM_BASE + 0x07] = (uint8_t) (free >> 8);
-    }
+    /* And that is the whole of it. What a slot holds, which interrupt it
+       was given, where its option ROM was put and every other resource it
+       asked for are the configuration utility's to work out and to write
+       here; a record count of zero is what a store that has never been
+       through one looks like, and the firmware answers "not configured"
+       for every slot until the utility has run. Writing records here
+       instead would be inventing an allocation nobody computed, and the
+       cards would be honouring a configuration that never existed. */
 
     /* The block keeps a sixteen bit sum of itself, from base+4 to the end
        of the region whose length sits at base+4. */
@@ -492,26 +421,18 @@ esc_cram_generate(esc_t *dev)
             sum, c[0x04]);
 }
 
-static void
-esc_cram_signature(const esc_t *dev, uint8_t *sig)
-{
-    memcpy(sig, dev->board_id, 4);
-
-    for (uint8_t slot = 1; slot <= EISA_MAX_SLOTS; slot++) {
-        uint8_t *ent = sig + (slot * 4);
-
-        if (eisa_slot_occupied(slot))
-            for (uint8_t i = 0; i < 4; i++)
-                ent[i] = eisa_slot_id(slot, i);
-        else
-            memset(ent, 0xff, 4);
-    }
-}
+/* Eight bytes after the pages saying who wrote the file. Nothing but us
+   reads them -- the window is only ever 8 KB wide, so the guest never sees
+   them -- and they exist so that a store left behind by a version that
+   wrote configuration records of its own is recognised and thrown away
+   rather than passed off to the firmware as the utility's work. */
+static const uint8_t esc_cram_tag[8] = { 'E', 'I', 'S', 'A', 'C', 'F', 'G', 0x02 };
 
 static void
 esc_cram_load(esc_t *dev)
 {
-    FILE *fp;
+    FILE   *fp;
+    uint8_t tag[sizeof(esc_cram_tag)];
 
     fp = nvr_fopen(dev->cram_file, "rb");
     if (fp == NULL) {
@@ -522,71 +443,36 @@ esc_cram_load(esc_t *dev)
         return;
     }
 
-    if (fread(dev->cram, 1, sizeof(dev->cram), fp) != sizeof(dev->cram)) {
+    if ((fread(dev->cram, 1, sizeof(dev->cram), fp) != sizeof(dev->cram)) ||
+        (fread(tag, 1, sizeof(tag), fp) != sizeof(tag)) ||
+        memcmp(tag, esc_cram_tag, sizeof(tag))) {
         fclose(fp);
-        esc_cram_generate(dev);
+        memset(dev->cram, 0, sizeof(dev->cram));
+        esc_log("ESC: the saved configuration RAM is not one of ours, "
+                "starting again\n");
+        if (dev->cram_auto)
+            esc_cram_generate(dev);
         return;
     }
-
-    /* The set of cards the file was written for is kept after the pages.
-       Nothing but us reads it: the window is only ever 8 KB wide, so the
-       guest never sees it. */
-    memset(dev->cram_sig, 0x00, sizeof(dev->cram_sig));
-    if (fread(dev->cram_sig, 1, sizeof(dev->cram_sig), fp) !=
-        sizeof(dev->cram_sig))
-        memset(dev->cram_sig, 0x00, sizeof(dev->cram_sig));
 
     fclose(fp);
 }
 
-/* The cards are plugged in after the chip set is built, so what is in the
-   slots cannot be known at init. The first look at the configuration RAM
-   is late enough, and the BIOS does not touch it before then. */
-static void
-esc_cram_verify(esc_t *dev)
-{
-    uint8_t sig[(EISA_MAX_SLOTS + 1) * 4];
-
-    if (dev->cram_checked)
-        return;
-    dev->cram_checked = 1;
-
-    esc_cram_signature(dev, sig);
-
-    /* Manual mode keeps whatever is in the file, the way a real board keeps
-       whatever the utility last wrote. Automatic mode keeps it too, right
-       up until the cards change: then it is thrown away, so the BIOS finds
-       an empty store and asks for the utility -- exactly what a real board
-       does when someone opens it up and moves a card. */
-    if (dev->cram_auto && memcmp(dev->cram_sig, sig, sizeof(sig))) {
-        esc_log("ESC: the cards have changed, starting the configuration "
-                "RAM again\n");
-        esc_cram_generate(dev);
-    }
-
-    memcpy(dev->cram_sig, sig, sizeof(sig));
-}
-
+/* Whatever the guest left in the store goes back to the file, every time
+   and whichever way the machine's automatic setting is turned: the utility
+   writing a configuration and finding it gone at the next power on is the
+   one thing a real board never does. */
 static void
 esc_cram_save(esc_t *dev)
 {
     FILE *fp;
-
-    /* With the machine's automatic configuration switched off the store is
-       the guest's business alone, and we do not write the file. */
-    if (!dev->cram_auto)
-        return;
-
-    /* If the guest never looked at the store the signature is still the
-       one the file came with, which is what should go back. */
-    esc_cram_verify(dev);
 
     fp = nvr_fopen(dev->cram_file, "wb");
     if (fp == NULL)
         return;
 
     fwrite(dev->cram, 1, sizeof(dev->cram), fp);
-    fwrite(dev->cram_sig, 1, sizeof(dev->cram_sig), fp);
+    fwrite(esc_cram_tag, 1, sizeof(esc_cram_tag), fp);
     fclose(fp);
 }
 
@@ -855,7 +741,6 @@ esc_write(uint16_t port, uint8_t val, void *priv)
             break;
 
         case 0x0800 ... 0x08ff: /* the configuration RAM itself */
-            esc_cram_verify(dev);
             esc_log("ESC: cram wr %02x:%02x = %02x\n", dev->cram_page,
                     port & 0xff, val);
             dev->cram[(dev->cram_page * 256) + (port & 0xff)] = val;
@@ -890,7 +775,6 @@ esc_read(uint16_t port, void *priv)
             return dev->cram_page;
 
         case 0x0800 ... 0x08ff:
-            esc_cram_verify((esc_t *) dev);
             esc_log("ESC: cram rd %02x:%02x = %02x\n", dev->cram_page,
                     port & 0xff,
                     dev->cram[(dev->cram_page * 256) + (port & 0xff)]);

@@ -289,10 +289,10 @@ aha1740_bios_writel(uint32_t addr, uint32_t val, void *priv)
 }
 
 /* BIOSADDR (zCC1): the low four bits are BIOSSEL, which picks a sixteen
-   kilobyte boundary, and zero means the BIOS is not mapped at all. Bit 6
+   kilobyte boundary, and zero means the BIOS is not mapped at all. Bit 5
    is RAMEN and bit 7 WRTPRT, which belong to the two kilobytes of overlay
-   RAM at the top of the window and are not modelled. The configuration
-   utility writes this, so what is set up here is only a starting point. */
+   RAM at the top of the window. Every one of them arrives from the
+   firmware replaying the EISA configuration; none is chosen here. */
 static uint32_t
 aha1740_bios_base(const aha1740_t *dev)
 {
@@ -739,28 +739,18 @@ aha1740_write(uint16_t port, uint8_t val, void *priv)
 static void
 aha1740_reset(void *priv)
 {
-    aha1740_t *dev   = (aha1740_t *) priv;
-    uint8_t    biosad = dev->regs[AHA_BIOSADR];
+    aha1740_t *dev = (aha1740_t *) priv;
 
+    /* A board comes out of reset unconfigured. Which interrupt it drives,
+       where its option ROM answers, which address its ports are at and
+       what its own SCSI address is are all written into the registers
+       below by the system firmware, replaying what the configuration
+       utility worked out and left in the EISA store. Nothing here decides
+       any of it. */
     memset(dev->regs, 0, sizeof(dev->regs));
 
-    /* Where the BIOS answers is part of the board's configuration, not
-       its running state: a reset does not make the option ROM vanish. */
-    dev->regs[AHA_BIOSADR] = biosad;
-
-    /* Enhanced mode, because that is what the configuration utility
-       writes and what every EISA driver expects to find. */
-    dev->regs[AHA_EBCNTRL] = 0x01;
-    dev->regs[AHA_PORTADR] = PORTADDR_ENH;
-    /* Left as the configuration utility set it; aha1740_bios_remap() is
-       what acts on it. */
-    dev->regs[AHA_INTDEF]  = 0x01; /* IRQ 10, level triggered */
-    dev->regs[AHA_SCSIDEF] = 0x07; /* the adapter is target seven */
-    dev->regs[AHA_BUSDEF]  = 0x00;
-    dev->regs[AHA_RESV1]   = 0x01; /* extended translation on */
-
-    dev->enhanced = 1;
-    dev->irq      = aha1740_intab[dev->regs[AHA_INTDEF] & 0x07];
+    dev->enhanced = 0;
+    dev->irq      = 0;
     dev->id       = 7;
 
     aha1740_bios_remap(dev);
@@ -770,9 +760,11 @@ aha1740_reset(void *priv)
 static void *
 aha1740_init(const device_t *info)
 {
-    aha1740_t *dev = (aha1740_t *) calloc(1, sizeof(aha1740_t));
-    uint8_t    id[4];
-    uint8_t    slot;
+    aha1740_t  *dev = (aha1740_t *) calloc(1, sizeof(aha1740_t));
+    const char *rev;
+    const char *fn;
+    uint8_t     id[4];
+    uint8_t     slot;
 
     dev->board = (uint8_t) (info->local & 0xff);
     dev->bus   = scsi_get_bus();
@@ -792,31 +784,28 @@ aha1740_init(const device_t *info)
         return NULL;
     }
 
-    /* The card's own BIOS, which is what an INT 13h boot needs. There is
-       no canonical dump of these in the ROM set, so the image is named by
-       the user rather than picked from a list. */
-    if (device_get_config_int("bios")) {
-        const char *rev = device_get_config_bios("bios_rev");
-        const char *fn  = device_get_bios_file(info, rev, 0);
+    /* The BIOS is a part soldered to the board, so it is always read in.
+       Whether it answers anywhere, and at which address, is BIOSADDR's
+       business, and that register is written by the firmware from what
+       the configuration utility stored. Out of reset it reads zero and
+       the window stays closed. */
+    rev = device_get_config_bios("bios_rev");
+    fn  = device_get_bios_file(info, rev, 0);
 
-        if ((fn != NULL) && (fn[0] != '\0')) {
-            dev->regs[AHA_BIOSADR] = (uint8_t)
-                (device_get_config_int("bios_addr") & 0x0f);
-
-            if (rom_init(&dev->bios, fn, aha1740_bios_base(dev), 0x4000,
-                         0x3fff, 0, MEM_MAPPING_EXTERNAL) >= 0) {
-                dev->has_bios = 1;
-                mem_mapping_set_handler(&dev->bios.mapping,
-                                        aha1740_bios_read, aha1740_bios_readw,
-                                        aha1740_bios_readl, aha1740_bios_write,
-                                        aha1740_bios_writew, aha1740_bios_writel);
-                mem_mapping_set_p(&dev->bios.mapping, dev);
-                memcpy(dev->bios_rom_top, &dev->bios.rom[AHA_BIOS_RAMOFF],
-                       sizeof(dev->bios_rom_top));
-                aha1740_bios_remap(dev);
-            } else
-                aha1740_log("AHA1740: could not read %s\n", fn);
-        }
+    if ((fn != NULL) && (fn[0] != '\0')) {
+        if (rom_init(&dev->bios, fn, aha1740_bios_base(dev), 0x4000,
+                     0x3fff, 0, MEM_MAPPING_EXTERNAL) >= 0) {
+            dev->has_bios = 1;
+            mem_mapping_set_handler(&dev->bios.mapping,
+                                    aha1740_bios_read, aha1740_bios_readw,
+                                    aha1740_bios_readl, aha1740_bios_write,
+                                    aha1740_bios_writew, aha1740_bios_writel);
+            mem_mapping_set_p(&dev->bios.mapping, dev);
+            memcpy(dev->bios_rom_top, &dev->bios.rom[AHA_BIOS_RAMOFF],
+                   sizeof(dev->bios_rom_top));
+            aha1740_bios_remap(dev);
+        } else
+            aha1740_log("AHA1740: could not read %s\n", fn);
     }
 
     timer_add(&dev->timer, aha1740_callback, dev, 0);
@@ -842,17 +831,6 @@ aha1740_close(void *priv)
 static const device_config_t aha1740_config[] = {
     // clang-format off
     {
-        .name           = "bios",
-        .description    = "Enable BIOS",
-        .type           = CONFIG_BINARY,
-        .default_string = NULL,
-        .default_int    = 0,
-        .file_filter    = NULL,
-        .spinner        = { 0 },
-        .selection      = { { 0 } },
-        .bios           = { { 0 } }
-    },
-    {
         .name           = "bios_rev",
         .description    = "BIOS Revision",
         .type           = CONFIG_BIOS,
@@ -872,30 +850,6 @@ static const device_config_t aha1740_config[] = {
             },
             { .files_no = 0 }
         }
-    },
-    {
-        .name           = "bios_addr",
-        .description    = "BIOS address",
-        .type           = CONFIG_SELECTION,
-        .default_string = NULL,
-        .default_int    = 4,
-        .file_filter    = NULL,
-        .spinner        = { 0 },
-        .selection      = {
-            { .description = "C4000H", .value = 1  },
-            { .description = "C8000H", .value = 2  },
-            { .description = "CC000H", .value = 3  },
-            { .description = "D0000H", .value = 4  },
-            { .description = "D4000H", .value = 5  },
-            { .description = "D8000H", .value = 6  },
-            { .description = "DC000H", .value = 7  },
-            { .description = "E0000H", .value = 8  },
-            { .description = "E4000H", .value = 9  },
-            { .description = "E8000H", .value = 10 },
-            { .description = "EC000H", .value = 11 },
-            { .description = ""                    }
-        },
-        .bios           = { { 0 } }
     },
     {
         .name           = "slot",

@@ -55,9 +55,14 @@
 
 static const device_config_t at_54tdp_config[] = {
     // clang-format off
+    /* Whether a machine that has never had the configuration utility run
+       on it starts with an empty but well formed EISA store, the way one
+       off a factory line does, or with nothing at all, the way one whose
+       battery has been out does. Either way what the utility writes is
+       kept: this decides the starting point and nothing else. */
     {
         .name           = "auto_eisa_config",
-        .description    = "Auto EISA Config",
+        .description    = "Initialise EISA configuration store",
         .type           = CONFIG_BINARY,
         .default_string = NULL,
         .default_int    = 1,

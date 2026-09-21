@@ -479,6 +479,7 @@ typedef struct aic7880_t {
     uint8_t  eisa_slot;
     uint8_t  eisa_conf[6]; /* 5a, 5b, 5c, 5d, 5e, 5f */
     uint8_t  eisa_global;  /* 56 */
+    uint8_t  bios_ctl_set; /* HA_274_BIOSCTRL has been written */
     uint8_t  bctl;
     uint8_t  bustime;
     uint8_t  busspd;
@@ -528,6 +529,7 @@ static void aic_bus_free(aic7880_t *dev);
 static void aic_tgt_next(aic7880_t *dev);
 static void aic_tgt_schedule(aic7880_t *dev);
 static void aic_chip_reset(aic7880_t *dev);
+static void aic_eisa_bios_remap(aic7880_t *dev);
 static void aic_pio_out(aic7880_t *dev);
 #ifdef ENABLE_AIC7880_LOG
 static const char *aic_phase_name(uint8_t phase);
@@ -1996,6 +1998,28 @@ aic_write(aic7880_t *dev, uint8_t addr, uint8_t val, int seq)
 
     if ((addr >= SRAM_BASE) && (addr < 0x60)) {
         dev->sram[addr - SRAM_BASE] = val;
+
+        /* On an EISA board the top six bytes are not scratch: they are the
+           configuration chip, which the system firmware fills in at every
+           power-on by replaying what the configuration utility left in the
+           EISA store. Keep a copy, because a chip reset clears scratch and
+           these have to survive it -- the driver resets the part and only
+           then reads its interrupt and its identifier back out. */
+        if (dev->eisa && (addr >= SCSICONF)) {
+            dev->eisa_conf[addr - SCSICONF] = val;
+
+            if (addr == INTDEF) {
+                /* The low four bits are the interrupt itself, not an index
+                   into a list of them. */
+                if (dev->irq != (val & 0x0f))
+                    aic_log("aic7770: IRQ %i, %s triggered\n", val & 0x0f,
+                            (val & 0x80) ? "edge" : "level");
+                dev->irq = val & 0x0f;
+            } else if (addr == HA_274_BIOSCTRL) {
+                dev->bios_ctl_set = 1;
+                aic_eisa_bios_remap(dev);
+            }
+        }
         return;
     }
     if (addr >= SCB_BASE) {
@@ -3059,18 +3083,47 @@ aic_seeprom_build(const aic7880_t *dev, uint16_t *nvr)
 
 /* ---- the register window ------------------------------------------------ */
 
-/* Where the configuration utility put the option ROM. The window size
-   follows the image, since the family shipped 16, 32 and 64 KB parts. */
+/* HA_274_BIOSCTRL, the last of the five registers the configuration file
+   asks the firmware to write. Bits 2:0 pick the sixteen kilobyte window,
+   counting up from 0CC000h in the order !ADP7771.CFG lists its choices,
+   and bits 5:4 are the mode, of which three means the BIOS is switched
+   off. Nothing else decides where the ROM answers. */
+static void
+aic_eisa_bios_remap(aic7880_t *dev)
+{
+    uint8_t  ctl = dev->eisa_conf[HA_274_BIOSCTRL - SCSICONF];
+    uint32_t base;
+
+    if (!dev->has_bios)
+        return;
+
+    /* Until the register has been written the board has not been through
+       an EISA configuration and its address decoder is idle, so the window
+       stays shut rather than landing somewhere nobody allocated. */
+    if (!dev->bios_ctl_set || ((ctl & 0x30) == 0x30)) {
+        mem_mapping_disable(&dev->bios.mapping);
+        aic_log("aic7770: BIOS off (biosctrl %02x)\n", ctl);
+        return;
+    }
+
+    base = 0xcc000 + (((uint32_t) ctl & 0x07) << 14);
+    mem_mapping_set_addr(&dev->bios.mapping, base, dev->rom_size);
+    mem_mapping_enable(&dev->bios.mapping);
+    aic_log("aic7770: BIOS %u KB at %05x\n", dev->rom_size >> 10, base);
+}
+
+/* The option ROM is a part on the board, so it is always read in. The
+   window size follows the image, since the family shipped 16, 32 and 64 KB
+   parts. */
 static void
 aic_eisa_bios(aic7880_t *dev, const device_t *info)
 {
     const char *rev = device_get_config_bios("bios_rev");
     const char *fn  = device_get_bios_file(info, rev, 0);
-    uint32_t    base;
     uint32_t    size;
     FILE       *fp;
 
-    if (!device_get_config_int("bios") || (fn == NULL) || (fn[0] == '\0'))
+    if ((fn == NULL) || (fn[0] == '\0'))
         return;
 
     fp = rom_fopen((char *) fn, "rb");
@@ -3089,9 +3142,7 @@ aic_eisa_bios(aic7880_t *dev, const device_t *info)
     else
         size = 0x10000;
 
-    base = 0xc0000 + (((uint32_t) device_get_config_int("bios_addr") & 0x07) << 14);
-
-    if (rom_init(&dev->bios, (char *) fn, base, size, size - 1, 0,
+    if (rom_init(&dev->bios, (char *) fn, 0xcc000, size, size - 1, 0,
                  MEM_MAPPING_EXTERNAL) < 0) {
         aic_log("aic7770: could not map %s\n", fn);
         return;
@@ -3100,11 +3151,8 @@ aic_eisa_bios(aic7880_t *dev, const device_t *info)
     dev->has_bios = 1;
     dev->rom_size = size;
 
-    /* Say the BIOS is there, so the driver takes the adapter's identifier
-       from the configuration chip instead of falling back to seven. */
-    dev->eisa_conf[HA_274_BIOSCTRL - SCSICONF] = 0x10;
-
-    aic_log("aic7770: BIOS %s, %u KB at %05x\n", fn, size >> 10, base);
+    aic_log("aic7770: BIOS %s, %u KB\n", fn, size >> 10);
+    aic_eisa_bios_remap(dev);
 }
 
 /* The EISA part answers in the last of its slot's four ranges, at zC00,
@@ -3484,28 +3532,21 @@ aic_init(const device_t *info)
     dev->timed_dev = (dev->board == BOARD_7880) ? 0 : device_get_config_int("dev_timing");
 
     if (dev->eisa) {
-        static const uint8_t irqs[8] = { 9, 10, 11, 12, 14, 15, 11, 11 };
-        uint8_t              id[4];
-        uint8_t              irq;
+        uint8_t id[4];
 
         dev->eisa_slot = (uint8_t) device_get_config_int("slot");
-        irq            = irqs[device_get_config_int("irq") & 0x07];
 
-        /* What the configuration utility writes and the driver reads back:
-           our own identifier with the terminators on, the interrupt it was
-           given, level triggered as the 274x is, a middling FIFO threshold
-           and bus off time, and a BIOS that is present so the driver takes
-           the identifier from here rather than falling back to seven. */
-        dev->eisa_conf[SCSICONF - SCSICONF]   = 0x80 | 0x20 | 0x07;
-        dev->eisa_conf[SCSICONF_B - SCSICONF] = 0x80 | 0x20 | 0x07;
-        dev->eisa_conf[INTDEF - SCSICONF]     = irq & 0x0f;
-        dev->eisa_conf[HOSTCONF - SCSICONF]   = 0x2d;
-        dev->eisa_conf[0x5e - SCSICONF]       = 0x00;
-        /* No BIOS unless one is given; aic_eisa_bios() says otherwise. */
-        dev->eisa_conf[HA_274_BIOSCTRL - SCSICONF] = 0x30;
-        dev->eisa_global                           = 0x01;
-
-        dev->irq = irq;
+        /* A 274x has no jumpers. Which interrupt it drives, how it is
+           triggered, what its own SCSI identifier is, where its option ROM
+           answers and whether it answers at all are every one of them
+           written into the configuration chip by the system firmware,
+           replaying the records the configuration utility worked out and
+           stored. Until that happens the board is unconfigured, and this
+           is what unconfigured looks like. */
+        memset(dev->eisa_conf, 0, sizeof(dev->eisa_conf));
+        dev->eisa_global  = 0x00;
+        dev->bios_ctl_set = 0;
+        dev->irq          = 0;
 
         aic_eisa_bios(dev, info);
 
@@ -3608,17 +3649,6 @@ aic_close(void *priv)
 static const device_config_t aic7770_config[] = {
     // clang-format off
     {
-        .name           = "bios",
-        .description    = "Enable BIOS",
-        .type           = CONFIG_BINARY,
-        .default_string = NULL,
-        .default_int    = 0,
-        .file_filter    = NULL,
-        .spinner        = { 0 },
-        .selection      = { { 0 } },
-        .bios           = { { 0 } }
-    },
-    {
         .name           = "bios_rev",
         .description    = "BIOS Revision",
         .type           = CONFIG_BIOS,
@@ -3640,27 +3670,6 @@ static const device_config_t aic7770_config[] = {
         }
     },
     {
-        .name           = "bios_addr",
-        .description    = "BIOS address",
-        .type           = CONFIG_SELECTION,
-        .default_string = NULL,
-        .default_int    = 4,
-        .file_filter    = NULL,
-        .spinner        = { 0 },
-        .selection      = {
-            { .description = "C0000H", .value = 0 },
-            { .description = "C4000H", .value = 1 },
-            { .description = "C8000H", .value = 2 },
-            { .description = "CC000H", .value = 3 },
-            { .description = "D0000H", .value = 4 },
-            { .description = "D4000H", .value = 5 },
-            { .description = "D8000H", .value = 6 },
-            { .description = "DC000H", .value = 7 },
-            { .description = ""                   }
-        },
-        .bios           = { { 0 } }
-    },
-    {
         .name           = "slot",
         .description    = "EISA slot",
         .type           = CONFIG_SELECTION,
@@ -3673,25 +3682,6 @@ static const device_config_t aic7770_config[] = {
             { .description = "Slot 2", .value = 2 },
             { .description = "Slot 3", .value = 3 },
             { .description = "Slot 4", .value = 4 },
-            { .description = ""                   }
-        },
-        .bios           = { { 0 } }
-    },
-    {
-        .name           = "irq",
-        .description    = "IRQ",
-        .type           = CONFIG_SELECTION,
-        .default_string = NULL,
-        .default_int    = 1,
-        .file_filter    = NULL,
-        .spinner        = { 0 },
-        .selection      = {
-            { .description = "IRQ 9",  .value = 0 },
-            { .description = "IRQ 10", .value = 1 },
-            { .description = "IRQ 11", .value = 2 },
-            { .description = "IRQ 12", .value = 3 },
-            { .description = "IRQ 14", .value = 4 },
-            { .description = "IRQ 15", .value = 5 },
             { .description = ""                   }
         },
         .bios           = { { 0 } }
