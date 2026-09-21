@@ -646,6 +646,7 @@ esc_init(UNUSED(const device_t *info))
     dma_set_params(1, 0xffffffff);
     dma_ext_mode_init();
     dma_high_page_init();
+    dma_eisa_init();
     dma_set_sg_base(0x04);
 
     /* Two interrupt controllers whose trigger can be chosen per line,
