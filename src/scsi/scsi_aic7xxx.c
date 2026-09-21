@@ -1118,6 +1118,12 @@ aic_tgt_next(aic7xxx_t *dev)
             c->ready_at = aic_now_us() + AIC_RESELECT_US + (dev->timed_dev ? c->delay : 0.0);
             aic_msgin(dev, disc, 2, AFTER_DISC);
             aic_bus_changed(dev);
+            /* The target has promised to come back in four microseconds,
+               and it is this clock that brings it. Parking a command
+               without starting the clock leaves the reselection waiting
+               on whatever the host happens to do next, which on a host
+               that is polling is its next timer tick. */
+            aic_seq_kick(dev);
             return;
         }
     }
@@ -3118,13 +3124,25 @@ aic_seq_timer(void *priv)
        still be woken by. */
     if (!aic_paused(dev) || (dev->bus_state == BUS_BUSY) || dev->selecting || dev->qin_cnt || (dev->dfcntrl & (SCSIEN | HDMAEN)) || aic_any_disconnected(dev))
         timer_on_auto(&dev->seq_timer, dev->asleep ? 50.0 : 10.0);
+    else {
+        /* Not re-arming is not the same as stopping. timer_on_auto() picks
+           timer_advance_u64() over timer_set_delay_u64() whenever period is
+           still positive, so a timer left merely un-armed is restarted from
+           the expiry it had when it went quiet -- however long ago that was
+           -- and from then on it can only creep forward one period per
+           service. Clearing the period is what makes the next start a
+           start. */
+        timer_stop(&dev->seq_timer);
+    }
 }
 
 static void
 aic_seq_kick(aic7xxx_t *dev)
 {
     dev->asleep = 0;
-    if (!timer_is_on(&dev->seq_timer))
+    /* timer_is_on() asks whether a long period has been split, not whether
+       the timer is running; a ten microsecond one never is. */
+    if (!timer_is_enabled(&dev->seq_timer))
         timer_on_auto(&dev->seq_timer, 1.0);
 }
 
