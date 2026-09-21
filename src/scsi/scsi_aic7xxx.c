@@ -785,6 +785,11 @@ aic_raise(aic7xxx_t *dev, uint8_t bits)
 static void
 aic_hard_error(aic7xxx_t *dev, uint8_t bits)
 {
+    /* Worth a line of its own. Firmware that runs on the real part does
+       not reach these, so one appearing here is this model's news, not
+       the firmware's. */
+    aic_log("hard error %02x (error %02x) at pc %03x, dfcntrl %02x\n",
+            bits, dev->error | bits, dev->pc, dev->dfcntrl);
     dev->error |= bits;
     if (dev->chip->faildis_honoured) {
         dev->seqctl &= ~PAUSEDIS;

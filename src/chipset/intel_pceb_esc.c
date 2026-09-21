@@ -1069,6 +1069,12 @@ esc_read(uint16_t port, void *priv)
         case 0x0c81:
         case 0x0c82:
         case 0x0c83:
+            /* Whoever is asking what board this is -- the firmware during
+               POST, and an operating system deciding whether there is an
+               EISA bus here at all. Worth seeing, since the answer used
+               to be nothing. */
+            esc_log("ESC: board id %d = %02x\n", port & 3,
+                    dev->board_id[port & 3]);
             return dev->board_id[port & 3];
 
         default:
