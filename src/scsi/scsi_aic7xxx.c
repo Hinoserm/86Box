@@ -3867,7 +3867,15 @@ aic_init(const device_t *info)
        "DualBusses", 02h for one wide channel and 00h for a single narrow
        one, and the configuration utility writes a SCSICONF for each
        channel, so a board whose CFG declares both is wired for both. */
-    dev->twin  = (dev->board == BOARD_2740);
+    /* One connector. The strap table gives SBLKCTL 00h for a single narrow
+       channel, 02h for one wide one and 08h for two, and what it holds out
+       of reset is what tells the firmware which of those it is wired to.
+       Strapping this card for two put the chip on channel B before anything
+       had run, and the firmware never moved it back: every selection went
+       to a connector with nothing on it. The second bus below is kept for
+       the twin members of the family, which strap 08h and are told apart by
+       the board rather than by the chip. */
+    dev->twin  = 0;
 
     dev->eisa  = (dev->board == BOARD_2740);
     /* Which part this board is built on, before anything asks. */
