@@ -6,8 +6,19 @@
  *
  *          This file is part of the 86Box distribution.
  *
- *          Adaptec AIC-7880 PCI Ultra SCSI controller, as the chip on a
- *          motherboard and as the AHA-2940 Ultra and Ultra Wide cards.
+ *          Adaptec's AIC-7xxx SCSI controllers.
+ *
+ *          One model covers the family because it is one design: the
+ *          AIC-7870 and AIC-7880 are the AIC-7770 grown up, with the same
+ *          sequencer and instruction set, the same register addresses, the
+ *          same SCB and queue arrangement and the same command flow. What
+ *          differs between them is the edge of the register file and a
+ *          couple of counts, and that is the table of aic_chip_t below
+ *          rather than a thread of conditionals through the whole file.
+ *
+ *          The boards: the AIC-7770 on the EISA AHA-2740, and the AIC-7870
+ *          and AIC-7880 as the chip on a motherboard and as the AHA-2940
+ *          Ultra and Ultra Wide cards.
  *
  *          HOW THIS PART IS MODELLED.
  *
@@ -71,7 +82,7 @@
 #include <86box/scsi_device.h>
 #include <86box/pic.h>
 #include <86box/eisa.h>
-#include <86box/scsi_aic7880.h>
+#include <86box/scsi_aic7xxx.h>
 #include <86box/plat_unused.h>
 
 /* Every command, phase change and interrupt is one line. The sequencer and
@@ -81,15 +92,15 @@
 #define AIC7880_LOG_SEQ  0
 #define AIC7880_LOG_REGS 0
 
-#ifdef ENABLE_AIC7880_LOG
-int aic7880_do_log = ENABLE_AIC7880_LOG;
+#ifdef ENABLE_AIC7XXX_LOG
+int aic7xxx_do_log = ENABLE_AIC7XXX_LOG;
 
 static void
 aic_log(const char *fmt, ...)
 {
     va_list ap;
 
-    if (aic7880_do_log) {
+    if (aic7xxx_do_log) {
         va_start(ap, fmt);
         pclog_ex(fmt, ap);
         va_end(ap);
@@ -460,7 +471,7 @@ typedef struct aic_cmd_t {
 
 #define AIC_CMDS 64
 
-typedef struct aic7880_t {
+typedef struct aic7xxx_t {
     /* PCI side */
     uint8_t       pci_slot;
     uint8_t       irq_state; /* belongs to the PCI layer */
@@ -530,7 +541,7 @@ typedef struct aic7880_t {
     uint8_t  sp;
     uint8_t  stack_rd;
     uint8_t  seqram[SEQ_INSNS * 4];
-#ifdef ENABLE_AIC7880_LOG
+#ifdef ENABLE_AIC7XXX_LOG
     /* The last instructions executed, for saying how the sequencer came to
        raise an interrupt without logging every instruction it ever runs. */
     struct {
@@ -614,25 +625,25 @@ typedef struct aic7880_t {
     pc_timer_t sel_timer;
     pc_timer_t tgt_timer;
     pc_timer_t busfree_timer;
-} aic7880_t;
+} aic7xxx_t;
 
-static void aic_update_irq(aic7880_t *dev);
-static void aic_seq_kick(aic7880_t *dev);
-static void aic_busfree_check(aic7880_t *dev);
-static void aic_seq_run(aic7880_t *dev);
-static void aic_pump(aic7880_t *dev);
-static void aic_bus_free(aic7880_t *dev);
-static void aic_tgt_next(aic7880_t *dev);
-static void aic_tgt_schedule(aic7880_t *dev);
-static void aic_chip_reset(aic7880_t *dev);
-static void aic_eisa_bios_remap(aic7880_t *dev);
-static void aic_eisa_bios_overlay(aic7880_t *dev);
-static void aic_pio_out(aic7880_t *dev);
-#ifdef ENABLE_AIC7880_LOG
+static void aic_update_irq(aic7xxx_t *dev);
+static void aic_seq_kick(aic7xxx_t *dev);
+static void aic_busfree_check(aic7xxx_t *dev);
+static void aic_seq_run(aic7xxx_t *dev);
+static void aic_pump(aic7xxx_t *dev);
+static void aic_bus_free(aic7xxx_t *dev);
+static void aic_tgt_next(aic7xxx_t *dev);
+static void aic_tgt_schedule(aic7xxx_t *dev);
+static void aic_chip_reset(aic7xxx_t *dev);
+static void aic_eisa_bios_remap(aic7xxx_t *dev);
+static void aic_eisa_bios_overlay(aic7xxx_t *dev);
+static void aic_pio_out(aic7xxx_t *dev);
+#ifdef ENABLE_AIC7XXX_LOG
 static const char *aic_phase_name(uint8_t phase);
 #endif
-static uint8_t aic_read(aic7880_t *dev, uint8_t addr, int seq);
-static void    aic_write(aic7880_t *dev, uint8_t addr, uint8_t val, int seq);
+static uint8_t aic_read(aic7xxx_t *dev, uint8_t addr, int seq);
+static void    aic_write(aic7xxx_t *dev, uint8_t addr, uint8_t val, int seq);
 
 /* Emulated time, in microseconds. It moves a translated block at a time
    and not an instruction at a time, which is as fine as anything here
@@ -649,7 +660,7 @@ aic_now_us(void)
    reached a point where it may stop, or whenever an interrupt is pending:
    an unserviced interrupt always stops the sequencer. */
 static int
-aic_paused(const aic7880_t *dev)
+aic_paused(const aic7xxx_t *dev)
 {
     /* A command-complete interrupt does not stop the sequencer; the other
        three do, and stay stopped until the host clears them. */
@@ -663,7 +674,7 @@ aic_paused(const aic7880_t *dev)
 }
 
 static void
-aic_update_irq(aic7880_t *dev)
+aic_update_irq(aic7xxx_t *dev)
 {
     uint8_t pend = dev->intstat & (SEQINT | SCSIINT | CMDCMPLT);
     uint8_t fire;
@@ -715,7 +726,7 @@ aic_update_irq(aic7880_t *dev)
 }
 
 static void
-aic_raise(aic7880_t *dev, uint8_t bits)
+aic_raise(aic7xxx_t *dev, uint8_t bits)
 {
     dev->intstat |= bits;
     aic_update_irq(dev);
@@ -724,7 +735,7 @@ aic_raise(aic7880_t *dev, uint8_t bits)
 /* SCSIINT is the one interrupt the sequencer does not raise itself: the
    SCSI cell raises it, and only for the conditions SIMODE lets through. */
 static void
-aic_scsi_int(aic7880_t *dev)
+aic_scsi_int(aic7xxx_t *dev)
 {
     if ((dev->sstat0 & dev->simode0) || (dev->sstat1 & dev->simode1)) {
         if (!(dev->intstat & SCSIINT)) {
@@ -739,14 +750,14 @@ aic_scsi_int(aic7880_t *dev)
 }
 
 static void
-aic_set_sstat1(aic7880_t *dev, uint8_t bits)
+aic_set_sstat1(aic7xxx_t *dev, uint8_t bits)
 {
     dev->sstat1 |= bits;
     aic_scsi_int(dev);
 }
 
 static void
-aic_set_sstat0(aic7880_t *dev, uint8_t bits)
+aic_set_sstat0(aic7xxx_t *dev, uint8_t bits)
 {
     dev->sstat0 |= bits;
     aic_scsi_int(dev);
@@ -758,7 +769,7 @@ aic_set_sstat0(aic7880_t *dev, uint8_t bits)
    the sequencer last acknowledged by writing SCSISIGO. Both are edges the
    firmware waits on, so they are recomputed whenever the bus moves. */
 static void
-aic_bus_changed(aic7880_t *dev)
+aic_bus_changed(aic7xxx_t *dev)
 {
     uint8_t phase;
     uint8_t req = (dev->bus_state == BUS_BUSY) && dev->tgt_req;
@@ -804,7 +815,7 @@ aic_bus_changed(aic7880_t *dev)
 }
 
 static void
-aic_bus_free(aic7880_t *dev)
+aic_bus_free(aic7xxx_t *dev)
 {
     aic_log("bus free (was %s%s)\n",
             (dev->bus_state == BUS_BUSY) ? "busy " : "free ",
@@ -826,7 +837,7 @@ aic_bus_free(aic7880_t *dev)
 }
 
 static aic_cmd_t *
-aic_cmd_alloc(aic7880_t *dev)
+aic_cmd_alloc(aic7xxx_t *dev)
 {
     for (uint8_t i = 0; i < AIC_CMDS; i++) {
         if (!dev->cmds[i].used) {
@@ -840,7 +851,7 @@ aic_cmd_alloc(aic7880_t *dev)
 }
 
 static void
-aic_cmd_free(aic7880_t *dev, aic_cmd_t *c)
+aic_cmd_free(aic7xxx_t *dev, aic_cmd_t *c)
 {
     if (c == NULL)
         return;
@@ -854,7 +865,7 @@ aic_cmd_free(aic7880_t *dev, aic_cmd_t *c)
 /* A target that wants to reconnect. Chosen round-robin-ish: the first
    disconnected command that is ready to say something. */
 static aic_cmd_t *
-aic_find_reselect(aic7880_t *dev)
+aic_find_reselect(aic7xxx_t *dev)
 {
     double now = aic_now_us();
 
@@ -866,7 +877,7 @@ aic_find_reselect(aic7880_t *dev)
 }
 
 static int
-aic_any_disconnected(const aic7880_t *dev)
+aic_any_disconnected(const aic7xxx_t *dev)
 {
     for (uint8_t i = 0; i < AIC_CMDS; i++) {
         if (dev->cmds[i].used && dev->cmds[i].waited)
@@ -876,7 +887,7 @@ aic_any_disconnected(const aic7880_t *dev)
 }
 
 static void
-aic_msgin(aic7880_t *dev, const uint8_t *msg, int len, uint8_t after)
+aic_msgin(aic7xxx_t *dev, const uint8_t *msg, int len, uint8_t after)
 {
     memcpy(dev->msgin, msg, len);
     dev->msgin_len = len;
@@ -888,7 +899,7 @@ aic_msgin(aic7880_t *dev, const uint8_t *msg, int len, uint8_t after)
 
 /* Run the target's command through 86Box's SCSI layer. */
 static void
-aic_cmd_execute(aic7880_t *dev, aic_cmd_t *c)
+aic_cmd_execute(aic7xxx_t *dev, aic_cmd_t *c)
 {
     scsi_device_t *sd = &scsi_devices[dev->bus][c->id];
     double         p;
@@ -927,7 +938,7 @@ aic_cmd_execute(aic7880_t *dev, aic_cmd_t *c)
 
 /* The data the target collected on a write is handed to the device. */
 static void
-aic_cmd_finish_out(aic7880_t *dev, aic_cmd_t *c)
+aic_cmd_finish_out(aic7xxx_t *dev, aic_cmd_t *c)
 {
     scsi_device_t *sd = &scsi_devices[dev->bus][c->id];
 
@@ -942,7 +953,7 @@ aic_cmd_finish_out(aic7880_t *dev, aic_cmd_t *c)
 }
 
 static void
-aic_tgt_schedule(aic7880_t *dev)
+aic_tgt_schedule(aic7xxx_t *dev)
 {
     timer_on_auto(&dev->tgt_timer, 1.0);
 }
@@ -970,7 +981,7 @@ aic_tgt_schedule(aic7880_t *dev)
    the DMA engine the handshake is the hardware's own and costs nothing
    here; under programmed I/O REQ is seen to fall first. */
 static void
-aic_tgt_req_again(aic7880_t *dev)
+aic_tgt_req_again(aic7xxx_t *dev)
 {
     if (dev->in_dma) {
         dev->tgt_req = 1;
@@ -985,7 +996,7 @@ aic_tgt_req_again(aic7880_t *dev)
 /* That REQ arrives. The host is far too slow to get in ahead of it, so
    any access from the host brings it forward. */
 static void
-aic_tgt_req_due(aic7880_t *dev)
+aic_tgt_req_due(aic7xxx_t *dev)
 {
     if (!dev->req_wait)
         return;
@@ -996,7 +1007,7 @@ aic_tgt_req_due(aic7880_t *dev)
     aic_bus_changed(dev);
 }
 
-#ifdef ENABLE_AIC7880_LOG
+#ifdef ENABLE_AIC7XXX_LOG
 static const char *
 aic_phase_name(uint8_t phase)
 {
@@ -1023,7 +1034,7 @@ aic_phase_name(uint8_t phase)
 /* Drive the target forward to whatever it does next. Called when a phase
    completes; sets up the next phase and REQ. */
 static void
-aic_tgt_next(aic7880_t *dev)
+aic_tgt_next(aic7xxx_t *dev)
 {
     aic_cmd_t *c = dev->cur;
     uint8_t    msg;
@@ -1130,14 +1141,14 @@ aic_tgt_next(aic7880_t *dev)
 static void
 aic_busfree_timer(void *priv)
 {
-    aic7880_t *dev = (aic7880_t *) priv;
+    aic7xxx_t *dev = (aic7xxx_t *) priv;
 
     aic_set_sstat1(dev, BUSFREE);
     aic_seq_kick(dev);
 }
 
 static void
-aic_busfree_check(aic7880_t *dev)
+aic_busfree_check(aic7xxx_t *dev)
 {
     const int idle = (dev->bus_state == BUS_FREE) && !dev->selecting &&
                      !(dev->scsisigo & (SELI | BSYI));
@@ -1153,14 +1164,14 @@ aic_busfree_check(aic7880_t *dev)
 static void
 aic_tgt_timer(void *priv)
 {
-    aic7880_t *dev = (aic7880_t *) priv;
+    aic7xxx_t *dev = (aic7xxx_t *) priv;
 
     aic_tgt_next(dev);
 }
 
 /* A byte the initiator drives at the target in the current phase. */
 static void
-aic_tgt_take(aic7880_t *dev, uint8_t val)
+aic_tgt_take(aic7xxx_t *dev, uint8_t val)
 {
     aic_cmd_t *c = dev->cur;
 
@@ -1274,7 +1285,7 @@ aic_tgt_take(aic7880_t *dev, uint8_t val)
 
 /* The byte the target is offering in the current phase. */
 static uint8_t
-aic_tgt_byte(const aic7880_t *dev)
+aic_tgt_byte(const aic7xxx_t *dev)
 {
     const aic_cmd_t *c = dev->cur;
 
@@ -1295,7 +1306,7 @@ aic_tgt_byte(const aic7880_t *dev)
 
 /* ACK for the byte the target was offering. */
 static void
-aic_tgt_acked(aic7880_t *dev)
+aic_tgt_acked(aic7xxx_t *dev)
 {
     aic_cmd_t *c = dev->cur;
 
@@ -1349,7 +1360,7 @@ aic_tgt_acked(aic7880_t *dev)
    high one; ENSELO starts it. A target that is there answers; one that is
    not lets the timer expire into SELTO. */
 static void
-aic_select_start(aic7880_t *dev)
+aic_select_start(aic7xxx_t *dev)
 {
     if (dev->selecting || (dev->bus_state != BUS_FREE))
         return;
@@ -1363,7 +1374,7 @@ aic_select_start(aic7880_t *dev)
 static void
 aic_select_done(void *priv)
 {
-    aic7880_t     *dev = (aic7880_t *) priv;
+    aic7xxx_t     *dev = (aic7xxx_t *) priv;
     uint8_t        id;
     scsi_device_t *sd;
     aic_cmd_t     *c;
@@ -1439,7 +1450,7 @@ aic_select_done(void *priv)
 /* A disconnected target coming back. Allowed when ENRSELI is set and the
    bus is free; SELID then names it with ONEBIT clear. */
 static void
-aic_reselect_try(aic7880_t *dev)
+aic_reselect_try(aic7xxx_t *dev)
 {
     aic_cmd_t *c;
     uint8_t    msg;
@@ -1473,7 +1484,7 @@ aic_reselect_try(aic7880_t *dev)
 }
 
 static void
-aic_scsi_reset_bus(aic7880_t *dev)
+aic_scsi_reset_bus(aic7xxx_t *dev)
 {
     aic_log("[%.3f ms] scsi bus reset\n", aic_now_us() / 1000.0);
     for (uint8_t i = 0; i < AIC_CMDS; i++) {
@@ -1512,14 +1523,14 @@ aic_scsi_reset_bus(aic7880_t *dev)
 /* ---- the data FIFO ------------------------------------------------------ */
 
 static void
-aic_fifo_reset(aic7880_t *dev)
+aic_fifo_reset(aic7xxx_t *dev)
 {
     dev->fifo_rd = dev->fifo_cnt = 0;
     dev->fifo_flush              = 0;
 }
 
 static void
-aic_fifo_push(aic7880_t *dev, uint8_t val)
+aic_fifo_push(aic7xxx_t *dev, uint8_t val)
 {
     if (dev->fifo_cnt >= FIFO_SIZE)
         return;
@@ -1528,7 +1539,7 @@ aic_fifo_push(aic7880_t *dev, uint8_t val)
 }
 
 static uint8_t
-aic_fifo_pop(aic7880_t *dev)
+aic_fifo_pop(aic7xxx_t *dev)
 {
     uint8_t val;
 
@@ -1543,7 +1554,7 @@ aic_fifo_pop(aic7880_t *dev)
 /* How many stored bytes start a burst from the FIFO to memory: DFTHRSH
    selects three quadwords, half, three quarters or all of it. */
 static uint32_t
-aic_fifo_threshold(const aic7880_t *dev)
+aic_fifo_threshold(const aic7xxx_t *dev)
 {
     static const uint16_t level[4] = { 24, FIFO_SIZE / 2, (FIFO_SIZE * 3) / 4, FIFO_SIZE };
 
@@ -1553,7 +1564,7 @@ aic_fifo_threshold(const aic7880_t *dev)
 /* The hardware flushes by itself when the SCSI side of a read is over:
    the count ran out, or the target left the phase. */
 static void
-aic_fifo_autoflush(aic7880_t *dev)
+aic_fifo_autoflush(aic7xxx_t *dev)
 {
     if (!(dev->dfcntrl & SCSIEN) || (dev->dfcntrl & DIRECTION) || (dev->sblkctl & AUTOFLUSHDIS))
         return;
@@ -1565,7 +1576,7 @@ aic_fifo_autoflush(aic7880_t *dev)
 
 /* Whether the host side has a reason to ask for the bus. */
 static int
-aic_dma_host_wants(const aic7880_t *dev)
+aic_dma_host_wants(const aic7xxx_t *dev)
 {
     if (!(dev->dfcntrl & HDMAEN) || (dev->hcnt == 0))
         return 0;
@@ -1588,7 +1599,7 @@ aic_dma_host_wants(const aic7880_t *dev)
    so the bytes are not there on the instruction after HDMAEN is set:
    HDONE is what says they are. */
 static void
-aic_dma_host(aic7880_t *dev)
+aic_dma_host(aic7xxx_t *dev)
 {
     uint8_t  buf[64];
     uint32_t n;
@@ -1657,7 +1668,7 @@ aic_dma_host(aic7880_t *dev)
    phase the target is in, counting STCNT down; SDONE says it hit zero and
    PHASEMIS stops it early. */
 static void
-aic_dma_scsi(aic7880_t *dev)
+aic_dma_scsi(aic7xxx_t *dev)
 {
     int out;
 
@@ -1717,7 +1728,7 @@ aic_dma_scsi(aic7880_t *dev)
    more to say than the host asked for: set the bit, wait for PHASEMIS.
    Without it that wait never ends. */
 static void
-aic_bitbucket(aic7880_t *dev)
+aic_bitbucket(aic7xxx_t *dev)
 {
     if (!(dev->sxfrctl1 & BITBUCKET) || (dev->bus_state != BUS_BUSY))
         return;
@@ -1736,7 +1747,7 @@ aic_bitbucket(aic7880_t *dev)
 /* Everything that can move, moves. Called after any register write that
    might unblock something. */
 static void
-aic_pump(aic7880_t *dev)
+aic_pump(aic7xxx_t *dev)
 {
     /* A selection that could not have the bus is still wanted. ENSELO
        written while a target holds the bus -- most often one that has
@@ -1772,7 +1783,7 @@ aic_pump(aic7880_t *dev)
    the 1996 aic7xxx driver does exactly that rather than DMA them. */
 /* Automatic PIO runs the same two counters as the DMA engine. */
 static void
-aic_pio_counted(aic7880_t *dev)
+aic_pio_counted(aic7xxx_t *dev)
 {
     if (dev->stcnt || (dev->sxfrctl1 & SWRAPEN)) {
         if (dev->stcnt == 0)
@@ -1785,7 +1796,7 @@ aic_pio_counted(aic7880_t *dev)
 /* The byte waiting in SCSIDATL goes out when PIO is enabled and the
    target is asking for one. */
 static void
-aic_pio_out(aic7880_t *dev)
+aic_pio_out(aic7xxx_t *dev)
 {
     if (!dev->datl_full || !(dev->sxfrctl0 & SPIOEN))
         return;
@@ -1797,7 +1808,7 @@ aic_pio_out(aic7880_t *dev)
 }
 
 static uint8_t
-aic_scb_offset(aic7880_t *dev, uint8_t addr)
+aic_scb_offset(aic7xxx_t *dev, uint8_t addr)
 {
     uint8_t off;
 
@@ -1812,7 +1823,7 @@ aic_scb_offset(aic7880_t *dev, uint8_t addr)
 /* The host is slow. By the time one of its accesses lands, anything that
    was a few sequencer instructions away has long since happened. */
 static void
-aic_host_catch_up(aic7880_t *dev)
+aic_host_catch_up(aic7xxx_t *dev)
 {
     aic_tgt_req_due(dev);
     if (dev->host_wait) {
@@ -1822,7 +1833,7 @@ aic_host_catch_up(aic7880_t *dev)
 }
 
 static uint8_t
-aic_read(aic7880_t *dev, uint8_t addr, int seq)
+aic_read(aic7xxx_t *dev, uint8_t addr, int seq)
 {
     uint8_t ret = 0;
 
@@ -2169,7 +2180,7 @@ aic_read(aic7880_t *dev, uint8_t addr, int seq)
 }
 
 static void
-aic_write(aic7880_t *dev, uint8_t addr, uint8_t val, int seq)
+aic_write(aic7xxx_t *dev, uint8_t addr, uint8_t val, int seq)
 {
     uint8_t was;
 
@@ -2568,7 +2579,7 @@ aic_write(aic7880_t *dev, uint8_t addr, uint8_t val, int seq)
         case INTSTAT:
             /* The sequencer writes its interrupt code here. */
             aic_log("[%.3f ms] seq: intstat %02x at %03x\n", aic_now_us() / 1000.0, val, dev->pc);
-#ifdef ENABLE_AIC7880_LOG
+#ifdef ENABLE_AIC7XXX_LOG
             /* Anything but a plain command complete or the delay timer:
                say how it got here. */
             if ((val & SEQINT) && ((val & 0xf0) != 0x00)) {
@@ -2717,14 +2728,14 @@ aic_write(aic7880_t *dev, uint8_t addr, uint8_t val, int seq)
 #define OP_JZ   0xf
 
 static void
-aic_seq_push(aic7880_t *dev, uint16_t addr)
+aic_seq_push(aic7xxx_t *dev, uint16_t addr)
 {
     dev->stack[dev->sp & 3] = addr;
     dev->sp                 = (dev->sp + 1) & 3;
 }
 
 static uint16_t
-aic_seq_pop(aic7880_t *dev)
+aic_seq_pop(aic7xxx_t *dev)
 {
     dev->sp = (dev->sp - 1) & 3;
     return dev->stack[dev->sp & 3];
@@ -2732,7 +2743,7 @@ aic_seq_pop(aic7880_t *dev)
 
 /* The arithmetic operations set both flags. */
 static void
-aic_seq_flags(aic7880_t *dev, uint8_t result, int carry)
+aic_seq_flags(aic7xxx_t *dev, uint8_t result, int carry)
 {
     dev->flags = 0;
     if (result == 0)
@@ -2748,7 +2759,7 @@ aic_seq_flags(aic7880_t *dev, uint8_t result, int carry)
    the carry survives both.  Clearing it here instead makes every such
    address computation land in the wrong page.  */
 static void
-aic_seq_flags_logic(aic7880_t *dev, uint8_t result)
+aic_seq_flags_logic(aic7xxx_t *dev, uint8_t result)
 {
     dev->flags &= CARRY;
     if (result == 0)
@@ -2783,7 +2794,7 @@ aic_rotate(uint8_t src, uint8_t ctl)
 }
 
 static void
-aic_seq_step(aic7880_t *dev)
+aic_seq_step(aic7xxx_t *dev)
 {
     uint32_t insn;
     uint8_t  opcode;
@@ -2827,7 +2838,7 @@ aic_seq_step(aic7880_t *dev)
     if (dev->host_wait && (--dev->host_wait == 0))
         aic_pump(dev);
 
-#ifdef ENABLE_AIC7880_LOG
+#ifdef ENABLE_AIC7XXX_LOG
     dev->trail[dev->trail_at].pc      = dev->pc;
     dev->trail[dev->trail_at].insn    = insn;
     dev->trail[dev->trail_at].stcnt   = dev->stcnt;
@@ -2986,7 +2997,7 @@ aic_seq_step(aic7880_t *dev)
 #define SEQ_CREDIT_MAX 2000.0
 
 static void
-aic_seq_run(aic7880_t *dev)
+aic_seq_run(aic7xxx_t *dev)
 {
     uint16_t last_pc = 0xffff;
     int      same    = 0;
@@ -3086,7 +3097,7 @@ aic_seq_run(aic7880_t *dev)
 static void
 aic_seq_timer(void *priv)
 {
-    aic7880_t *dev = (aic7880_t *) priv;
+    aic7xxx_t *dev = (aic7xxx_t *) priv;
 
     /* Microseconds have passed: whatever was a few instructions away has
        happened. */
@@ -3111,7 +3122,7 @@ aic_seq_timer(void *priv)
 }
 
 static void
-aic_seq_kick(aic7880_t *dev)
+aic_seq_kick(aic7xxx_t *dev)
 {
     dev->asleep = 0;
     if (!timer_is_on(&dev->seq_timer))
@@ -3121,7 +3132,7 @@ aic_seq_kick(aic7880_t *dev)
 /* ---- reset -------------------------------------------------------------- */
 
 static void
-aic_chip_reset(aic7880_t *dev)
+aic_chip_reset(aic7xxx_t *dev)
 {
     aic_log("chip reset\n");
 
@@ -3254,7 +3265,7 @@ aic_seeprom_onboard(uint16_t *nvr)
 }
 
 static void
-aic_seeprom_build(const aic7880_t *dev, uint16_t *nvr)
+aic_seeprom_build(const aic7xxx_t *dev, uint16_t *nvr)
 {
     if (dev->board == BOARD_7880) {
         aic_seeprom_onboard(nvr);
@@ -3324,7 +3335,7 @@ aic_seeprom_build(const aic7880_t *dev, uint16_t *nvr)
    emulator reads, so that the processor fetching code and a bus master
    fetching a command block both see the same thing. */
 static void
-aic_eisa_bios_overlay(aic7880_t *dev)
+aic_eisa_bios_overlay(aic7xxx_t *dev)
 {
     if (!dev->has_bios || (dev->rom_size < 0x4000))
         return;
@@ -3339,7 +3350,7 @@ aic_eisa_bios_overlay(aic7880_t *dev)
 static uint8_t
 aic_eisa_rom_read(uint32_t addr, void *priv)
 {
-    const aic7880_t *dev = (const aic7880_t *) priv;
+    const aic7xxx_t *dev = (const aic7xxx_t *) priv;
 
     return dev->bios.rom[(addr - dev->bios.mapping.base) & (dev->rom_size - 1)];
 }
@@ -3361,7 +3372,7 @@ aic_eisa_rom_readl(uint32_t addr, void *priv)
 static void
 aic_eisa_rom_write(uint32_t addr, uint8_t val, void *priv)
 {
-    aic7880_t *dev = (aic7880_t *) priv;
+    aic7xxx_t *dev = (aic7xxx_t *) priv;
     uint32_t   off = (addr - dev->bios.mapping.base) & (dev->rom_size - 1);
     uint8_t    ctl = dev->eisa_conf[HA_274_BIOSCTRL - SCSICONF];
 
@@ -3394,7 +3405,7 @@ aic_eisa_rom_writel(uint32_t addr, uint32_t val, void *priv)
    and bits 5:4 are the mode, of which three means the BIOS is switched
    off. Nothing else decides where the ROM answers. */
 static void
-aic_eisa_bios_remap(aic7880_t *dev)
+aic_eisa_bios_remap(aic7xxx_t *dev)
 {
     uint8_t  ctl = dev->eisa_conf[HA_274_BIOSCTRL - SCSICONF];
     uint32_t base;
@@ -3421,7 +3432,7 @@ aic_eisa_bios_remap(aic7880_t *dev)
    window size follows the image, since the family shipped 16, 32 and 64 KB
    parts. */
 static void
-aic_eisa_bios(aic7880_t *dev, const device_t *info)
+aic_eisa_bios(aic7xxx_t *dev, const device_t *info)
 {
     const char *rev = device_get_config_bios("bios_rev");
     const char *fn  = device_get_bios_file(info, rev, 0);
@@ -3476,7 +3487,7 @@ aic_eisa_bios(aic7880_t *dev, const device_t *info)
 static uint8_t
 aic_eisa_read(uint16_t port, void *priv)
 {
-    aic7880_t *dev = (aic7880_t *) priv;
+    aic7xxx_t *dev = (aic7xxx_t *) priv;
     uint8_t    reg = (uint8_t) (port & 0xff);
 
     if ((port & 0x0f00) != 0x0c00)
@@ -3488,7 +3499,7 @@ aic_eisa_read(uint16_t port, void *priv)
 static void
 aic_eisa_write(uint16_t port, uint8_t val, void *priv)
 {
-    aic7880_t *dev = (aic7880_t *) priv;
+    aic7xxx_t *dev = (aic7xxx_t *) priv;
     uint8_t    reg = (uint8_t) (port & 0xff);
 
     if ((port & 0x0f00) != 0x0c00)
@@ -3500,7 +3511,7 @@ aic_eisa_write(uint16_t port, uint8_t val, void *priv)
 static uint8_t
 aic_io_readb(uint16_t port, void *priv)
 {
-    aic7880_t *dev = (aic7880_t *) priv;
+    aic7xxx_t *dev = (aic7xxx_t *) priv;
     uint8_t    reg = (uint8_t) (port - dev->io_base);
     uint8_t    ret = aic_read(dev, reg, 0);
 
@@ -3525,7 +3536,7 @@ aic_io_readl(uint16_t port, void *priv)
 static void
 aic_io_writeb(uint16_t port, uint8_t val, void *priv)
 {
-    aic7880_t *dev = (aic7880_t *) priv;
+    aic7xxx_t *dev = (aic7xxx_t *) priv;
     uint8_t    reg = (uint8_t) (port - dev->io_base);
 
     if (AIC7880_LOG_REGS) {
@@ -3551,7 +3562,7 @@ aic_io_writel(uint16_t port, uint32_t val, void *priv)
 static uint8_t
 aic_mem_readb(uint32_t addr, void *priv)
 {
-    aic7880_t *dev = (aic7880_t *) priv;
+    aic7xxx_t *dev = (aic7xxx_t *) priv;
 
     return aic_read(dev, (uint8_t) (addr & 0xff), 0);
 }
@@ -3571,7 +3582,7 @@ aic_mem_readl(uint32_t addr, void *priv)
 static void
 aic_mem_writeb(uint32_t addr, uint8_t val, void *priv)
 {
-    aic7880_t *dev = (aic7880_t *) priv;
+    aic7xxx_t *dev = (aic7xxx_t *) priv;
 
     aic_write(dev, (uint8_t) (addr & 0xff), val, 0);
 }
@@ -3593,7 +3604,7 @@ aic_mem_writel(uint32_t addr, uint32_t val, void *priv)
 /* BAR0 is 256 bytes of I/O space and BAR1 the same in memory; the driver
    picks whichever the machine's BIOS mapped. */
 static void
-aic_io_update(aic7880_t *dev)
+aic_io_update(aic7xxx_t *dev)
 {
     uint16_t want = (uint16_t) (((uint16_t) dev->pci_regs[0x11] << 8) | (dev->pci_regs[0x10] & 0x00));
     uint8_t  on   = (dev->pci_regs[0x04] & PCI_COMMAND_IO) && (want != 0);
@@ -3612,7 +3623,7 @@ aic_io_update(aic7880_t *dev)
 }
 
 static void
-aic_mem_update(aic7880_t *dev)
+aic_mem_update(aic7xxx_t *dev)
 {
     uint32_t want = ((uint32_t) dev->pci_regs[0x17] << 24) | ((uint32_t) dev->pci_regs[0x16] << 16) | ((uint32_t) dev->pci_regs[0x15] << 8);
 
@@ -3623,7 +3634,7 @@ aic_mem_update(aic7880_t *dev)
 }
 
 static void
-aic_bios_update(aic7880_t *dev)
+aic_bios_update(aic7xxx_t *dev)
 {
     uint32_t want;
 
@@ -3645,7 +3656,7 @@ aic_bios_update(aic7880_t *dev)
 static uint8_t
 aic_rom_readb(uint32_t addr, void *priv)
 {
-    aic7880_t *dev = (aic7880_t *) priv;
+    aic7xxx_t *dev = (aic7xxx_t *) priv;
 
     dev->rom_reads++;
     if (dev->rom_reads <= 48)
@@ -3672,7 +3683,7 @@ aic_rom_readl(uint32_t addr, void *priv)
 static uint8_t
 aic_pci_read(int func, int addr, UNUSED(int len), void *priv)
 {
-    const aic7880_t *dev = (const aic7880_t *) priv;
+    const aic7xxx_t *dev = (const aic7xxx_t *) priv;
 
     if (func > 0)
         return 0xff;
@@ -3685,7 +3696,7 @@ aic_pci_read(int func, int addr, UNUSED(int len), void *priv)
 static void
 aic_pci_write(int func, int addr, UNUSED(int len), uint8_t val, void *priv)
 {
-    aic7880_t *dev = (aic7880_t *) priv;
+    aic7xxx_t *dev = (aic7xxx_t *) priv;
 
     if (func > 0)
         return;
@@ -3778,7 +3789,7 @@ aic_pci_write(int func, int addr, UNUSED(int len), uint8_t val, void *priv)
 static void
 aic_reset(void *priv)
 {
-    aic7880_t *dev = (aic7880_t *) priv;
+    aic7xxx_t *dev = (aic7xxx_t *) priv;
 
     aic_chip_reset(dev);
 }
@@ -3786,7 +3797,7 @@ aic_reset(void *priv)
 static void *
 aic_init(const device_t *info)
 {
-    aic7880_t               *dev = (aic7880_t *) calloc(1, sizeof(aic7880_t));
+    aic7xxx_t               *dev = (aic7xxx_t *) calloc(1, sizeof(aic7xxx_t));
     nmc93cxx_eeprom_params_t params;
     uint16_t                 nvr[128];
     char                     fn[1024] = { 0 };
@@ -3959,7 +3970,7 @@ aic_init(const device_t *info)
 static void
 aic_close(void *priv)
 {
-    aic7880_t *dev = (aic7880_t *) priv;
+    aic7xxx_t *dev = (aic7xxx_t *) priv;
 
     if (dev == NULL)
         return;

@@ -6,19 +6,20 @@
  *
  *          This file is part of the 86Box distribution.
  *
- *          Adaptec AIC-7880 PCI Ultra SCSI controller, as the chip on a
+ *          Adaptec's AIC-7xxx SCSI controllers: the AIC-7770 on the EISA
+ *          AHA-2740, and the AIC-7870 and AIC-7880 as the chip on a
  *          motherboard and as the AHA-2940 Ultra and Ultra Wide cards.
  *
  * Authors: Michael Pratte, <mpratte@makefox.group>
  *
  *          Copyright 2026 Michael Pratte.
  */
-#ifndef SCSI_AIC7880_H
-#define SCSI_AIC7880_H
+#ifndef SCSI_AIC7XXX_H
+#define SCSI_AIC7XXX_H
 
 extern const device_t aic7880_pci_device;
 extern const device_t aha2940u_pci_device;
 extern const device_t aha2940uw_pci_device;
 extern const device_t aha2740_device;
 
-#endif /*SCSI_AIC7880_H*/
+#endif /*SCSI_AIC7XXX_H*/

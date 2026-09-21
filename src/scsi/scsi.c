@@ -35,7 +35,7 @@
 #include <86box/scsi_disk.h>
 #include <86box/scsi_aha154x.h>
 #include <86box/scsi_aha1740.h>
-#include <86box/scsi_aic7880.h>
+#include <86box/scsi_aic7xxx.h>
 #include <86box/scsi_buslogic.h>
 #include <86box/scsi_ncr5380.h>
 #include <86box/scsi_ncr53c8xx.h>

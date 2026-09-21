@@ -48,7 +48,7 @@
 #include <86box/chipset.h>
 #include <86box/eisa.h>
 #include <86box/esc.h>
-#include <86box/scsi_aic7880.h>
+#include <86box/scsi_aic7xxx.h>
 #include <86box/machine.h>
 #include <86box/rom.h>
 #include <86box/keyboard.h>
