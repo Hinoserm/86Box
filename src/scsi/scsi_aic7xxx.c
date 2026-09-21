@@ -2783,6 +2783,8 @@ aic_write(aic7xxx_t *dev, uint8_t addr, uint8_t val, int seq)
             dev->dfwaddr[0] = val;
             break;
         case DFWADDR + 1:
+            if (dev->dfcntrl & (HDMAEN | SDMAEN))
+                aic_hard_error(dev, ILLSADDR);
             dev->dfwaddr[1] = val;
             break;
         case DFRADDR:
@@ -2791,6 +2793,8 @@ aic_write(aic7xxx_t *dev, uint8_t addr, uint8_t val, int seq)
             dev->dfraddr[0] = val;
             break;
         case DFRADDR + 1:
+            if (dev->dfcntrl & (HDMAEN | SDMAEN))
+                aic_hard_error(dev, ILLSADDR);
             dev->dfraddr[1] = val;
             break;
         case DFDAT:
