@@ -101,5 +101,13 @@ machine_at_54tdp_init(const machine_t *model)
        and the system BIOS carries its option ROM. */
     device_add(&aic7880_pci_device);
 
+    /* This board takes two processors and its firmware says so, but the
+       APIC in the ESC has nowhere to deliver a message: there is no local
+       APIC here. An operating system that believes the table and routes
+       its interrupts through the APIC therefore loses them -- the mouse
+       first, because nothing else needs IRQ 12. Blanking the table is what
+       the other dual-capable Socket 7 boards do. */
+    device_add(&ioapic_device);
+
     return ret;
 }

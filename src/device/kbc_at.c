@@ -358,6 +358,8 @@ kbc_do_irq(atkbc_t *dev)
             picint_common(1 << dev->irq[1], 0, 0, NULL);
 
         if (dev->channel >= 2) {
+            kbc_at_log("ATkbc: AUX irq %i (cmdbyte %02X, ps2 %i)\n",
+                       dev->irq[1], dev->mem[0x20], !!(dev->misc_flags & FLAG_PS2));
             if (dev->irq[1] != 0xffff)
                 picint_common(1 << dev->irq[1], 0, 1, NULL);
         } else {
@@ -398,6 +400,9 @@ kbc_send_to_ob(atkbc_t *dev, uint8_t val, uint8_t channel, uint8_t stat_hi)
 
             if (dev->mem[0x20] & 0x02)
                 kbc_set_do_irq(dev, channel);
+            else
+                kbc_at_log("ATkbc: aux byte %02X but the mouse interrupt is "
+                           "off in the command byte (%02X)\n", temp, dev->mem[0x20]);
         } else if (dev->mem[0x20] & 0x01)
             kbc_set_do_irq(dev, channel);
     } else if (dev->mem[0x20] & 0x01)

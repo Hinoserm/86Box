@@ -2963,9 +2963,43 @@ aic_chip_reset(aic7880_t *dev)
    BIOS enabled and everything at the factory setting would carry, plus
    the checksum the driver verifies. Without this the driver falls back
    to defaults and says it could not read the SEEPROM. */
+/* The part on the AIR 54TDP, read off the board itself. One hundred and
+   twenty-eight words with the sum of the first hundred and twenty-seven in
+   the last, and no signature anywhere: the layout a card uses -- two
+   thirty-two word halves, each with its own checksum -- is not what this
+   chip has. The device words say include in the BIOS scan, disconnection
+   allowed and synchronous at rate eight, and notably not wide. */
+static void
+aic_seeprom_onboard(uint16_t *nvr)
+{
+    uint16_t sum = 0;
+
+    for (uint16_t i = 0; i < 128; i++)
+        nvr[i] = 0xffff;
+
+    for (uint8_t i = 0; i < 16; i++)
+        nvr[i] = 0x0238;
+
+    nvr[16] = 0x18b6; /* bios_control */
+    nvr[17] = 0x005c; /* adapter_control */
+    nvr[18] = 0x2807; /* bus release time, and our SCSI ID is seven */
+    nvr[19] = 0x0010;
+    nvr[20] = 0xff00;
+    nvr[126] = 0x00ff;
+
+    for (uint16_t i = 0; i < 127; i++)
+        sum = (uint16_t) (sum + nvr[i]);
+    nvr[127] = sum;
+}
+
 static void
 aic_seeprom_build(const aic7880_t *dev, uint16_t *nvr)
 {
+    if (dev->board == BOARD_7880) {
+        aic_seeprom_onboard(nvr);
+        return;
+    }
+
     uint16_t sum;
     uint16_t flags;
 
