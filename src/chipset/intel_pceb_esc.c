@@ -650,17 +650,24 @@ esc_cram_decode(esc_t *dev)
         }
     }
 
-    /* Bit 7 is not acted on, and the reason is worth writing down. This
-       board's firmware clears it within the first few dozen ESC accesses
-       of POST -- it writes PCSB 7Fh, which also disables the parallel port
-       decode because the Super I/O has that -- and never sets it again. On
-       the real machine that says there is no configuration SRAM behind the
-       ESC at all, which fits its clearing MS bit 5, the page address
-       generation, in the same breath. Honouring the bit therefore takes
-       the configuration RAM away for the whole of the machine's life, and
-       the EISA configuration store is kept in that RAM here. Where the
-       real board keeps its store instead -- the flash, most likely -- is
-       not modelled yet, so the window stays decoded until it is. */
+    /* Bit 7 is deliberately not acted on, and this is the one place the
+       model knowingly departs from the book.
+
+       This board's firmware clears it once, early in POST -- it writes
+       PCSB 7Fh, which disables the parallel port decode in the same write
+       because the Super I/O has that -- and never sets it again. It also
+       clears MS bit 5, the configuration RAM page address generation.
+       Two independent ways of saying the same thing: there is no
+       configuration SRAM behind the ESC on this board.
+
+       The EISA configuration store lives in that RAM here, though, and
+       obeying the bit was tried: the store goes unreadable for the whole
+       of the machine's life and the firmware stops configuring the cards
+       in the slots altogether -- the AHA-2740 comes up with no interrupt
+       and no option ROM window. The real board must keep its store
+       somewhere else, the flash its firmware writes being the obvious
+       candidate, and until that is modelled the window has to stay
+       decoded for anything in a slot to be configured at all. */
     (void) want;
 }
 
