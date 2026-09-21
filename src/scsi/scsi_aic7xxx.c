@@ -779,6 +779,19 @@ aic_scsi_int(aic7xxx_t *dev)
            asks for cannot be refused. */
         dev->seqctl &= ~PAUSEDIS;
         aic_raise(dev, SCSIINT);
+    } else if (dev->intstat & SCSIINT) {
+        /* And it goes away again on its own. SCSIINT is not a latch the
+           host clears: the data book gives it as set "if the corresponding
+           interrupt is enabled in SIMODE0 or SIMODE1", which is why the
+           part has no CLRSCSIINT to clear it with -- bit 2 of CLRINT is
+           not used. Taking the cause away through CLRSINT0 or CLRSINT1 is
+           what takes the interrupt with it. Leaving it standing hangs a
+           driver that has done everything the part asked of it: the 2740
+           BIOS clears the selection timeout it gets on the first empty ID
+           of its scan, sees the interrupt still there, and clears it for
+           ever. */
+        dev->intstat &= ~SCSIINT;
+        aic_update_irq(dev);
     }
 }
 
@@ -1842,6 +1855,8 @@ aic_read(aic7xxx_t *dev, uint8_t addr, int seq)
     if (!seq)
         aic_host_catch_up(dev);
 
+    }
+
     if ((addr >= SRAM_BASE) && (addr < 0x60))
         return dev->sram[addr - SRAM_BASE];
     if (addr >= SCB_BASE) {
@@ -2328,6 +2343,7 @@ aic_write(aic7xxx_t *dev, uint8_t addr, uint8_t val, int seq)
         case SSTAT0: /* CLRSINT0 */
             dev->sstat0 &= ~(val & 0x7a);
             aic_bus_changed(dev);
+            aic_scsi_int(dev);
             break;
         case SSTAT1: /* CLRSINT1 */
             /* RST cannot be cleared from under ourselves: while we hold the
@@ -2342,6 +2358,7 @@ aic_write(aic7xxx_t *dev, uint8_t addr, uint8_t val, int seq)
                 dev->scsisigo &= ~0x10;
             }
             aic_bus_changed(dev);
+            aic_scsi_int(dev);
             break;
         case SIMODE0:
             /* Bit 7 is not used and always reads zero. */
