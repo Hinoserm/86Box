@@ -444,6 +444,16 @@ esc_apic_reg_read(esc_t *dev)
     switch (reg) {
         case 0x00: /* APICID */
         case 0x02: /* APICARB, which a write to the identifier also loads */
+            /* Both are the four bit identifier in 27:24 and nothing else;
+               the arbitration register "is loaded whenever the I/O APIC
+               ID Register is written".
+
+               Its printed default, 000F0011h, is not to be taken for the
+               value it should read: that is the version register's
+               contents one entry above, and it contradicts this
+               register's own bit table, which has 31:28 and 23:0
+               reserved. The table is self-consistent and the default is
+               not, so the table is what is followed here. */
             return dev->apic_id;
 
         case 0x01: /* APICVER */
@@ -989,6 +999,12 @@ esc_conf_write(esc_t *dev, uint8_t index, uint8_t val)
         /* Three general purpose chip selects, each a low and high address
            and a mask. Nothing on this side of the bridge acts on them;
            they drive pins. */
+        /* The three general purpose chip selects -- a base address, a
+           mask, and in GPXBC whether the X-Bus transceiver goes with
+           them. They decode a window and pull a pin low over it, for
+           whatever a board hangs there. This one hangs nothing: the
+           pins go nowhere, and a chip select with no part on the end of
+           it has nothing to do but read back. */
         case 0x64:
         case 0x65:
         case 0x66:
@@ -1049,6 +1065,13 @@ esc_conf_write(esc_t *dev, uint8_t index, uint8_t val)
             break;
         case 0xac: /* CTLTMRL */
         case 0xae: /* CTLTMRH */
+            /* How long STPCLK# is held low and high when SMICNTL bit 2
+               has handed its timing to these. STPCLK# is a pin into the
+               processor that throttles it, and 86Box's does not have
+               one -- nor the stop grant cycle the book has it waiting
+               for. The same absence leaves SMICNTL bits 2 and 1 stored
+               and no more, bit 1 being what makes a read of APMC assert
+               the signal in the first place. */
             dev->regs[index] = val;
             break;
 
