@@ -34,6 +34,9 @@ extern const device_t pceb_device; /* 82375SB */
 
 /* The board identifier the ESC answers with at 0C80-0C83. A machine sets
    this before the BIOS looks. */
+/* SERR# pulsing active, gated by Mode Select bit 3. */
+extern void esc_serr(void);
+
 extern void esc_set_embedded_id(const char *mfg, uint16_t product,
                                uint8_t rev);
 extern void esc_set_board_id(const char *mfg, uint16_t product, uint8_t rev);

@@ -85,6 +85,7 @@ typedef struct esc_t {
     uint8_t regs[256];
 
     uint8_t nmi_esc;  /* 0461h, extended NMI status and control */
+    uint8_t serr_nmi; /* SERR# is what is holding NMI up */
     uint8_t last_mst; /* 0464h, last EISA bus master granted */
 
     void   *apm;
@@ -277,6 +278,36 @@ esc_fail_safe_timer(int new_out, int old_out, UNUSED(void *priv))
 /* A PIRQ reaches an IRQ only when its own route register says so and the
    mode select register has the PIRQ pins switched on at all: bit 6 there
    is what makes them PIRQs rather than MREQs. */
+/* SERR# pulsing active. MS bit 3 is the whole of its control: "This bit
+   is used to disable (0) or enable (1) the generation of NMI based on
+   SERR# signal pulsing active. When this bit = 1 (and NMIs are enabled
+   via the NMIERTC Register) and SERR# is asserted, the NMI signal is
+   asserted." The NMIERTC half of that is the nmi_mask the processor
+   already tests, so the mode select bit is all there is to do here.
+
+   It has no status bit to go with it anywhere, which the book is careful
+   to say twice -- NMISC bit 7 "does not reflect status of an NMI caused
+   by SERR#, which is enabled and disabled/cleared via the MS Register" --
+   so a handler distinguishes this from the other sources by their status
+   bits all reading zero.
+
+   Nothing in 86Box pulses SERR# today: no device asserts it and there is
+   no bus error to raise it. This is the part of that path the ESC owns,
+   and it works the moment something does. */
+void
+esc_serr(void)
+{
+    esc_t *dev = esc_inst;
+
+    if ((dev == NULL) || !(dev->regs[0x40] & 0x08))
+        return;
+
+    esc_log("ESC: SERR#\n");
+    dev->serr_nmi  = 1;
+    nmi            = 1;
+    nmi_auto_clear = 1;
+}
+
 static void
 esc_pirq_update(esc_t *dev)
 {
@@ -726,6 +757,16 @@ esc_conf_write(esc_t *dev, uint8_t index, uint8_t val)
             dev->regs[0x40] = val & 0x7f;
             esc_log("ESC: mode select %02x, PIRQs %s\n", val,
                     (val & 0x40) ? "on" : "off");
+            /* Bit 3 is the other direction of the SERR# gate, and taking
+               it away is how a handler clears that NMI -- it is the only
+               control SERR# has: "When this bit = 0, the NMI signal is
+               negated and SERR# is disabled from generating an NMI."
+               Only negate what SERR# itself raised; the other sources
+               have their own enables and are not ours to drop. */
+            if (!(val & 0x08) && dev->serr_nmi) {
+                dev->serr_nmi = 0;
+                nmi           = 0;
+            }
             esc_pirq_update(dev);
             break;
 
@@ -910,6 +951,18 @@ esc_write(uint16_t port, uint8_t val, void *priv)
             /* Bits 7:4 are status and read only; the rest are controls,
                and clearing an enable also clears the condition it
                reported. */
+            /* Bits 6 and 4, the bus timeout statuses, are never set
+               here. They report an EISA master that kept the bus more
+               than 64 BCLKs after the ESC took MACKx# away -- "EISA
+               Masters must release the bus within 64 BCLKs (8 ms) after
+               the ESC negates MACKx#. If the bus master attempts to start
+               a new bus cycle after this timeout period, a bus timeout
+               (NMI) is generated." 86Box has no interval for that to be
+               measured over: a bus master here runs its whole transfer
+               inside one timer callback, so the bus is never held across
+               an arbitration cycle and MACKx# is never negated under a
+               master still running. The bits read back, and the enable
+               below clears them, but nothing can raise them. */
             dev->nmi_esc = (uint8_t) ((dev->nmi_esc & 0xf0) | (val & 0x0f));
             /* The book states this clearing for the fail-safe and bus
                timeout enables below and not for this one; it is done the
