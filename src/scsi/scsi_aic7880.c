@@ -209,7 +209,7 @@ aic_log(const char *fmt, ...)
 #define BOARD_7880         0 /* the chip on a motherboard */
 #define BOARD_2940U        1 /* AHA-2940 Ultra, narrow */
 #define BOARD_2940UW       2 /* AHA-2940 Ultra Wide */
-#define BOARD_2740         3 /* AHA-2740, an AIC-7770 on EISA */
+#define BOARD_2740         3 /* AHA-2740, an AIC-7770 on EISA, one narrow bus */
 
 #define SRAM_BASE    0x20 /* scratch RAM, to 0x5f */
 
@@ -293,7 +293,10 @@ aic_log(const char *fmt, ...)
 #define SEQINT       0x01
 #define INT_PEND     (BRKADRINT | SEQINT | SCSIINT | CMDCMPLT)
 #define ERROR        0x92 /* CLRINT on write */
+#define PARERR       0x08
 #define ILLOPCODE    0x04
+#define ILLSADDR     0x02
+#define ILLHADDR     0x01
 #define CLRPARERR    0x10
 #define CLRBRKADRINT 0x08
 #define CLRSCSIINT   0x04
@@ -401,6 +404,10 @@ typedef struct aic7880_t {
     uint32_t      rom_size;
     uint8_t       bus;
     uint8_t       wide;
+    uint8_t       twin;  /* the board is wired for two SCSI buses */
+    uint8_t       scb_mask; /* how many SCB pages the part really has */
+    uint8_t       q_depth;  /* and how deep its two queues are */
+    uint8_t       eisa_id[4];
     uint8_t       board; /* info->local */
 
     nmc93cxx_eeprom_t *eeprom;
@@ -534,10 +541,12 @@ typedef struct aic7880_t {
     pc_timer_t seq_timer;
     pc_timer_t sel_timer;
     pc_timer_t tgt_timer;
+    pc_timer_t busfree_timer;
 } aic7880_t;
 
 static void aic_update_irq(aic7880_t *dev);
 static void aic_seq_kick(aic7880_t *dev);
+static void aic_busfree_check(aic7880_t *dev);
 static void aic_seq_run(aic7880_t *dev);
 static void aic_pump(aic7880_t *dev);
 static void aic_bus_free(aic7880_t *dev);
@@ -610,8 +619,17 @@ aic_update_irq(aic7880_t *dev)
     aic_log("irq %s intstat %02x\n", fire ? "high" : "low", dev->intstat);
 
     if (dev->eisa) {
-        /* The 274x is a level triggered board. */
-        if (fire)
+        /* How the board drives the pin is not ours to pick either. Bit 7
+           of INTDEF in the configuration chip says edge or level, and the
+           configuration utility offers both for every interrupt it will
+           hand out -- "IRQ 11 LEVEL" and "IRQ 11 EDGE" are separate
+           choices, and each writes that bit. */
+        if (dev->eisa_conf[INTDEF - SCSICONF] & 0x80) {
+            if (fire)
+                picint(1 << dev->irq);
+            else
+                picintc(1 << dev->irq);
+        } else if (fire)
             picintlevel(1 << dev->irq, &dev->irq_state);
         else
             picintclevel(1 << dev->irq, &dev->irq_state);
@@ -707,6 +725,8 @@ aic_bus_changed(aic7880_t *dev)
     /* A byte already waiting in the PIO latch goes out on this REQ. */
     aic_pio_out(dev);
 
+    aic_busfree_check(dev);
+
     dev->asleep = 0;
     aic_seq_kick(dev);
 }
@@ -730,7 +750,6 @@ aic_bus_free(aic7880_t *dev)
     dev->msgin_len = dev->msgin_pos = 0;
     dev->msgout_len                 = 0;
     timer_stop(&dev->tgt_timer);
-    aic_set_sstat1(dev, BUSFREE);
     aic_bus_changed(dev);
 }
 
@@ -1029,6 +1048,36 @@ aic_tgt_next(aic7880_t *dev)
     aic_bus_changed(dev);
 }
 
+/* BUSFREE is not an edge. The data book has it set "when the BSY and SEL
+   signals have been negated on the SCSI bus for 400ns", and reflecting the
+   state of the bus rather than one transition on it -- so a selection that
+   simply ran out, having never made the bus busy, still ends with the bus
+   free and the latch set. The delay is the whole of it: latching the
+   moment the bus looks idle fires while a selection is being set up and
+   drowns the firmware in bus-free interrupts. */
+static void
+aic_busfree_timer(void *priv)
+{
+    aic7880_t *dev = (aic7880_t *) priv;
+
+    aic_set_sstat1(dev, BUSFREE);
+    aic_seq_kick(dev);
+}
+
+static void
+aic_busfree_check(aic7880_t *dev)
+{
+    const int idle = (dev->bus_state == BUS_FREE) && !dev->selecting &&
+                     !(dev->scsisigo & (SELI | BSYI));
+
+    if (!idle) {
+        timer_stop(&dev->busfree_timer);
+        return;
+    }
+    if (!(dev->sstat1 & BUSFREE) && !timer_is_on(&dev->busfree_timer))
+        timer_on_auto(&dev->busfree_timer, 0.4);
+}
+
 static void
 aic_tgt_timer(void *priv)
 {
@@ -1252,13 +1301,17 @@ aic_select_done(void *priv)
         return;
     }
 
-    id = (dev->scsiid >> 4) & (dev->wide ? 0x0f : 0x07);
-    sd = &scsi_devices[dev->bus][id];
+    /* TID is four bits wide whatever the bus is. On a narrow one the top
+       half of the addresses is not aliased down onto the bottom half --
+       there is simply nothing there, and selecting it runs out. */
+    id = (dev->scsiid >> 4) & 0x0f;
+    sd = (!dev->wide && (id > 7)) ? NULL : &scsi_devices[dev->bus][id];
 
     /* Nobody there, and the selection timer not running: the chip goes on
        selecting for ever. CHIPRST leaves ENSTIMER clear, so a driver that
        resets the part and does not put SXFRCTL1 back never sees SELTO. */
-    if ((dev->scsiseq & ENSELO) && !scsi_device_present(sd) && !(dev->sxfrctl1 & ENSTIMER)) {
+    if ((dev->scsiseq & ENSELO) && ((sd == NULL) || !scsi_device_present(sd)) &&
+        !(dev->sxfrctl1 & ENSTIMER)) {
         aic_log("select %i: nobody, and no selection timer\n", id);
         return;
     }
@@ -1271,8 +1324,14 @@ aic_select_done(void *priv)
         return;
     }
 
-    if (!scsi_device_present(sd)) {
+    if ((sd == NULL) || !scsi_device_present(sd)) {
         aic_log("select %i: timeout\n", id);
+        /* The bus is free again the moment SEL is dropped, and BUSFREE
+           "will reflect the state of the SCSI bus" -- a selection that
+           ran out never made it busy, so nothing else would have said so.
+           Latching it only here, rather than on every look at an idle
+           bus, is the 400ns the data book asks for that this model has no
+           clock to count. */
         aic_set_sstat1(dev, SELTO);
         aic_bus_changed(dev);
         return;
@@ -1296,10 +1355,10 @@ aic_select_done(void *priv)
     if (dev->scsiseq & ENAUTOATNO)
         dev->atn = 1;
     aic_log("select %i: ok (atn %i) scb%u ctl %02x tcl %02x cmdlen %02x\n", id,
-            dev->atn, dev->scbptr & (SCB_COUNT - 1),
-            dev->scb[dev->scbptr & (SCB_COUNT - 1)][0x00],
-            dev->scb[dev->scbptr & (SCB_COUNT - 1)][0x01],
-            dev->scb[dev->scbptr & (SCB_COUNT - 1)][0x18]);
+            dev->atn, dev->scbptr & dev->scb_mask,
+            dev->scb[dev->scbptr & dev->scb_mask][0x00],
+            dev->scb[dev->scbptr & dev->scb_mask][0x01],
+            dev->scb[dev->scbptr & dev->scb_mask][0x18]);
     aic_set_sstat0(dev, SELDO);
     /* The target asks for the identify message, or for the command. */
     aic_tgt_next(dev);
@@ -1363,6 +1422,7 @@ aic_scsi_reset_bus(aic7880_t *dev)
     dev->sstat0 &= ~(SELDO | SELDI | SELINGO);
     timer_stop(&dev->sel_timer);
     timer_stop(&dev->tgt_timer);
+    timer_stop(&dev->busfree_timer);
 
     for (uint8_t i = 0; i < (dev->wide ? 16 : 8); i++)
         scsi_device_reset(&scsi_devices[dev->bus][i]);
@@ -1701,7 +1761,7 @@ aic_read(aic7880_t *dev, uint8_t addr, int seq)
         return dev->sram[addr - SRAM_BASE];
     if (addr >= SCB_BASE) {
         if (addr < (SCB_BASE + SCB_SIZE))
-            return dev->scb[dev->scbptr & (SCB_COUNT - 1)][aic_scb_offset(dev, addr)];
+            return dev->scb[dev->scbptr & dev->scb_mask][aic_scb_offset(dev, addr)];
         return dev->misc[addr - 0xc0];
     }
 
@@ -1797,15 +1857,29 @@ aic_read(aic7880_t *dev, uint8_t addr, int seq)
                 return ((uint64_t) ((double) tsc * 4294967296.0 / (double) TIMER_USEC / 51.2) & 1) ? 0x80 : 0x00;
             return 0;
         case SLEEPCTL:
+            if (dev->eisa)
+                return 0x00;
             return dev->sleepctl;
         case SELID:
             return dev->selid;
         case SCAMCTL:
+            if (dev->eisa)
+                return 0x00;
             return dev->scamctl;
         case SPIOCAP:
+            /* Nothing lives here on an AIC-7770; the data book's summary
+               runs SELTIMER, SELID, then straight to SBLKCTL, and "all
+               unassigned register locations return 0". The board's
+               serial EEPROM, its GAL and its SCAM logic are all later
+               parts -- this one keeps its settings in the EISA
+               configuration chip up in scratch instead. */
+            if (dev->eisa)
+                return 0x00;
             /* SEEPROM and termination sensing present, and a ROM. */
             return 0x08 | 0x02 | 0x01;
         case BRDCTL:
+            if (dev->eisa)
+                return 0x00;
             /* The board's GAL. BRDRW with BRDCS reads the cable sense
                lines; bank zero has the internal connectors, bank one
                (BRDDAT5) the external one and the EEPROM-present bit. In
@@ -1818,6 +1892,8 @@ aic_read(aic7880_t *dev, uint8_t addr, int seq)
             }
             return dev->brdctl;
         case SEECTL:
+            if (dev->eisa)
+                return 0x00;
             ret = dev->seectl & ~(SEEDI | SEERDY | EXTARBACK);
             /* Access is granted as soon as it is asked for, and the
                800ns strobe the driver times with SEERDY is instant. */
@@ -1889,14 +1965,18 @@ aic_read(aic7880_t *dev, uint8_t addr, int seq)
             dev->sp       = (dev->sp - 1) & 3;
             return ret;
 
-        case DSVENDID:
-        case DSVENDID + 1:
-        case DSDEVID:
-        case DSDEVID + 1:
-            /* The vendor and device ID, readable from device space. A
-               driver that has the register window but not the slot -- and
-               the sequencer, which has nothing else -- tells the parts of
-               the family apart here. */
+        case DSVENDID:     /* BID0 on the EISA part */
+        case DSVENDID + 1: /* BID1 */
+        case DSDEVID:      /* BID2 */
+        case DSDEVID + 1:  /* BID3 */
+            /* On the AIC-7770 these four are the EISA product identifier
+               and nothing else: read only, and the same bytes the slot
+               answers with at zC80. On the PCI parts they are the vendor
+               and device ID, which is how a driver with the register
+               window but not the slot -- and the sequencer, which has
+               nothing else -- tells the family apart. */
+            if (dev->eisa)
+                return dev->eisa_id[addr - DSVENDID];
             return dev->pci_regs[addr - DSVENDID];
         case DSCOMMAND0: /* BCTL on the EISA part */
             if (dev->eisa)
@@ -1972,10 +2052,16 @@ aic_read(aic7880_t *dev, uint8_t addr, int seq)
         case DFWADDR:
             return dev->dfwaddr[0];
         case DFWADDR + 1:
+            /* Reserved on an AIC-7770: its write address is the seven
+               bits of DFWADDR0 and the byte above it reads zero. */
+            if (dev->eisa)
+                return 0x00;
             return dev->dfwaddr[1];
         case DFRADDR:
             return dev->dfraddr[0];
         case DFRADDR + 1:
+            if (dev->eisa)
+                return 0x00;
             return dev->dfraddr[1];
         case DFDAT:
             return aic_fifo_pop(dev);
@@ -1986,7 +2072,7 @@ aic_read(aic7880_t *dev, uint8_t addr, int seq)
             if (dev->qin_cnt == 0)
                 return 0;
             ret         = dev->qin[dev->qin_rd];
-            dev->qin_rd = (dev->qin_rd + 1) % QUEUE_SIZE;
+            dev->qin_rd = (dev->qin_rd + 1) % dev->q_depth;
             dev->qin_cnt--;
             return ret;
         case QINCNT:
@@ -1996,7 +2082,7 @@ aic_read(aic7880_t *dev, uint8_t addr, int seq)
             if (dev->qout_cnt == 0)
                 return 0xff;
             ret          = dev->qout[dev->qout_rd];
-            dev->qout_rd = (dev->qout_rd + 1) % QUEUE_SIZE;
+            dev->qout_rd = (dev->qout_rd + 1) % dev->q_depth;
             dev->qout_cnt--;
             return ret;
         case QOUTCNT:
@@ -2047,7 +2133,7 @@ aic_write(aic7880_t *dev, uint8_t addr, uint8_t val, int seq)
     }
     if (addr >= SCB_BASE) {
         if (addr < (SCB_BASE + SCB_SIZE))
-            dev->scb[dev->scbptr & (SCB_COUNT - 1)][aic_scb_offset(dev, addr)] = val;
+            dev->scb[dev->scbptr & dev->scb_mask][aic_scb_offset(dev, addr)] = val;
         else
             dev->misc[addr - 0xc0] = val;
         return;
@@ -2069,6 +2155,14 @@ aic_write(aic7880_t *dev, uint8_t addr, uint8_t val, int seq)
             aic_pump(dev);
             break;
         case SXFRCTL0:
+            /* The AIC-7770 has CLRSTCNT, SPIOEN and CLRCHN here and
+               nothing else: DFON, DFPEXP, FAST20 and SCAMEN came with the
+               later parts and always read zero on this one. Masking them
+               away on the way in rather than on the way out keeps the
+               rest of the model from acting on a bit the part has not
+               got -- SELTIMER, for one, behaves differently under SCAMEN. */
+            if (dev->eisa)
+                val &= (CLRSTCNT | SPIOEN | CLRCHN);
             was           = dev->sxfrctl0;
             dev->sxfrctl0 = val & ~(CLRSTCNT | CLRCHN | 0x01);
             /* Taking automatic PIO away takes SPIORDY with it, and turning
@@ -2090,6 +2184,9 @@ aic_write(aic7880_t *dev, uint8_t addr, uint8_t val, int seq)
             aic_bus_changed(dev);
             break;
         case SXFRCTL1:
+            /* Likewise ACTNEGEN and STPWEN. */
+            if (dev->eisa)
+                val &= (BITBUCKET | SWRAPEN | ENSPCHK | STIMESEL | ENSTIMER);
             was           = dev->sxfrctl1;
             dev->sxfrctl1 = val;
             /* The timer switched on under a selection nobody is answering. */
@@ -2161,10 +2258,13 @@ aic_write(aic7880_t *dev, uint8_t addr, uint8_t val, int seq)
                 dev->atn = 0;
                 dev->scsisigo &= ~0x10;
             }
+            /* Cleared while the bus is still free, it comes back after
+               another 400ns, because the bus is still free. */
             aic_bus_changed(dev);
             break;
         case SIMODE0:
-            dev->simode0 = val;
+            /* Bit 7 is not used and always reads zero. */
+            dev->simode0 = dev->eisa ? (val & 0x7f) : val;
             aic_scsi_int(dev);
             break;
         case SIMODE1:
@@ -2176,6 +2276,8 @@ aic_write(aic7880_t *dev, uint8_t addr, uint8_t val, int seq)
         case SELTIMER: /* read only */
             break;
         case SLEEPCTL:
+            if (dev->eisa)
+                break;
             /* Only the sequencer can put itself to sleep, and not at all
                with SLEEPDIS set. */
             dev->sleepctl = val & SLEEPDIS;
@@ -2183,26 +2285,48 @@ aic_write(aic7880_t *dev, uint8_t addr, uint8_t val, int seq)
                 dev->sleepctl |= val & (SLP1 | SLP0);
             break;
         case SELID:
+            /* Read only: the part puts the address that selected or
+               reselected it here itself. */
+            if (dev->eisa)
+                break;
             dev->selid = val;
             break;
         case SCAMCTL:
+            if (dev->eisa)
+                break;
             dev->scamctl = val;
             break;
         case SPIOCAP:
             break;
         case BRDCTL:
+            if (dev->eisa)
+                break;
             dev->brdctl = val;
             break;
         case SEECTL:
+            if (dev->eisa)
+                break;
             dev->seectl = val;
             nmc93cxx_eeprom_write(dev->eeprom, !!(val & SEECS), !!(val & SEECK),
                                   !!(val & SEEDO));
             break;
         case SBLKCTL:
-            dev->sblkctl = val & (DIAGLEDEN | DIAGLEDON | AUTOFLUSHDIS | SELWIDE);
+            /* On the AIC-7770 this register is SELBUSB and SELWIDE and
+               nothing else; the data book has bits 7-4, 2 and 0 always
+               reading zero. Which of the two the part will take is
+               strapped on its pins, and a board wired for channel A alone
+               "will force SELBUSB and SELWIDE to be cleared". The later
+               parts put their diagnostic LED and FIFO bits in the same
+               register, so they keep the wider mask. */
+            if (dev->eisa)
+                dev->sblkctl = val & ((dev->twin ? SELBUSB : 0) |
+                                      (dev->wide ? SELWIDE : 0));
+            else
+                dev->sblkctl = val & (DIAGLEDEN | DIAGLEDON | AUTOFLUSHDIS | SELWIDE);
             break;
         case SCSITEST:
-            dev->scsitest = val;
+            /* RQAKCNT, CNTRTEST and CTSTMODE, and nothing above them. */
+            dev->scsitest = dev->eisa ? (val & 0x07) : val;
             break;
 
         case SEQCTL:
@@ -2316,13 +2440,12 @@ aic_write(aic7880_t *dev, uint8_t addr, uint8_t val, int seq)
             was         = dev->hcntrl;
             dev->hcntrl = val & ~CHIPRST;
             if (val & CHIPRST) {
-                /* A chip reset from the host. On the later parts the same
-                   bit reads back as CHIPRSTACK to say it happened; the
-                   AIC-7770 has no such acknowledgement and the bit simply
-                   reads back clear, which is what its drivers expect. */
+                /* A chip reset from the host. The same bit reads back as
+                   CHIPRESETACK to say it happened, on this part as much as
+                   on the later ones, and stays set until a write to this
+                   register clears it. */
                 aic_chip_reset(dev);
-                if (!dev->eisa)
-                    dev->hcntrl |= CHIPRST;
+                dev->hcntrl |= CHIPRST;
                 return;
             }
             /* SWINT drives the interrupt pin and nothing else: it is how
@@ -2370,7 +2493,10 @@ aic_write(aic7880_t *dev, uint8_t addr, uint8_t val, int seq)
             dev->hcnt = (dev->hcnt & 0x00ffff) | (val << 16);
             break;
         case SCBPTR:
-            dev->scbptr = val;
+            /* Bits 1:0 pick the page, bit 2 reads back what was put in it
+               and does nothing else, and everything above always reads
+               zero. */
+            dev->scbptr = dev->eisa ? (val & 0x07) : val;
             break;
         case INTSTAT:
             /* The sequencer writes its interrupt code here. */
@@ -2405,14 +2531,21 @@ aic_write(aic7880_t *dev, uint8_t addr, uint8_t val, int seq)
             }
             if (val & CLRBRKADRINT)
                 dev->intstat &= ~BRKADRINT;
-            if (val & CLRSCSIINT)
+            /* There is no CLRSCSIINT on an AIC-7770: the data book has
+               bit 2 of CLRINT not used, and the SCSI interrupt goes away
+               only when the status behind it does, through CLRSINT0 and
+               CLRSINT1. Clearing it from here let the interrupt and the
+               status it stands for disagree. */
+            if ((val & CLRSCSIINT) && !dev->eisa)
                 dev->intstat &= ~SCSIINT;
             if (val & CLRCMDINT)
                 dev->intstat &= ~CMDCMPLT;
             if (val & CLRSEQINT)
                 dev->intstat &= ~SEQINT;
-            /* Not ILLOPCODE: only a chip reset gets rid of that. */
-            if (val & CLRPARERR)
+            /* Not ILLOPCODE: only a chip reset gets rid of that. And not
+               on an AIC-7770 at all -- bit 4 of CLRINT is not used there,
+               the parity error being a later part's. */
+            if ((val & CLRPARERR) && !dev->eisa)
                 dev->error &= ILLOPCODE;
             aic_update_irq(dev);
             /* SCSIINT reads clear only once its cause has been dealt with;
@@ -2457,20 +2590,21 @@ aic_write(aic7880_t *dev, uint8_t addr, uint8_t val, int seq)
                 aic_pump(dev);
             break;
         case SCBCNT:
-            dev->scbcnt = val;
+            dev->scbcnt = val & (SCBAUTO | 0x1f);
             break;
         case QINFIFO:
             /* The host queues an SCB for the sequencer. */
-            if (dev->qin_cnt < QUEUE_SIZE) {
-                dev->qin[(dev->qin_rd + dev->qin_cnt) % QUEUE_SIZE] = val & 0x0f;
+            /* "Writes when QINCNT=4 ... are ignored." */
+            if (dev->qin_cnt < dev->q_depth) {
+                dev->qin[(dev->qin_rd + dev->qin_cnt) % dev->q_depth] = val & dev->scb_mask;
                 dev->qin_cnt++;
             }
             aic_seq_kick(dev);
             break;
         case QOUTFIFO:
             /* The sequencer posts a completion. */
-            if (dev->qout_cnt < QUEUE_SIZE) {
-                dev->qout[(dev->qout_rd + dev->qout_cnt) % QUEUE_SIZE] = val & 0x0f;
+            if (dev->qout_cnt < dev->q_depth) {
+                dev->qout[(dev->qout_rd + dev->qout_cnt) % dev->q_depth] = val & dev->scb_mask;
                 dev->qout_cnt++;
             }
             break;
@@ -2598,8 +2732,13 @@ aic_seq_step(aic7880_t *dev)
     int      taken;
 
     if (dev->pc >= SEQ_INSNS) {
-        dev->error |= ILLOPCODE;
-        aic_raise(dev, BRKADRINT);
+        /* An address that decodes to nothing. FAILDIS turns the interrupt
+           for that off; the error itself is still recorded, and the
+           interrupt takes PAUSEDIS away the same as any other. */
+        dev->error |= ILLSADDR;
+        dev->seqctl &= ~PAUSEDIS;
+        if (!(dev->seqctl & FAILDIS))
+            aic_raise(dev, BRKADRINT);
         return;
     }
 
@@ -2747,7 +2886,8 @@ aic_seq_step(aic7880_t *dev)
         default:
             dev->error |= ILLOPCODE;
             dev->seqctl &= ~PAUSEDIS;
-            aic_raise(dev, BRKADRINT);
+            if (!(dev->seqctl & FAILDIS))
+                aic_raise(dev, BRKADRINT);
             return;
     }
 
@@ -2938,14 +3078,25 @@ aic_chip_reset(aic7880_t *dev)
     dev->selid                  = 0;
     dev->scamctl = dev->brdctl = dev->seectl = 0;
     /* The LED bits come up set, and SELWIDE as the WIDEPS# pin is strapped. */
-    dev->sblkctl    = DIAGLEDEN | DIAGLEDON | (dev->wide ? SELWIDE : 0);
+    /* Out of reset the register reads back the board's own wiring: 08h
+       for two buses, 02h for one wide one, 00h for a single narrow one.
+       That is how the card's BIOS learns what it is fitted to. Answering
+       0C0h instead left it unable to tell, and it went looking down a
+       second bus that is not there. */
+    if (dev->eisa)
+        dev->sblkctl = (dev->twin ? SELBUSB : 0) | (dev->wide ? SELWIDE : 0);
+    else
+        dev->sblkctl = DIAGLEDEN | DIAGLEDON | (dev->wide ? SELWIDE : 0);
     dev->scsitest   = 0;
     dev->sleepctl   = 0;
     dev->must_step  = 0;
     dev->seq_idle   = 1;
     dev->seq_credit = 0.0;
 
-    dev->seqctl   = PERRORDIS | FASTMODE;
+    /* PERRORDIS is the one bit here whose reset value is a one; FASTMODE
+       is not, so the sequencer starts on the slower of its two clocks
+       until the firmware asks for the other. */
+    dev->seqctl   = PERRORDIS;
     dev->pc       = 0;
     dev->ram_byte = 0;
     dev->accum = dev->sindex = dev->dindex = 0;
@@ -2957,9 +3108,12 @@ aic_chip_reset(aic7880_t *dev)
     dev->dscommand0  = 0;
     dev->dscommand1  = 0;
     dev->dspcistatus = 0;
-    /* CHIPRSTACK reads back in the same bit as CHIPRST, and says the
-       part has not been touched since it was reset. */
-    dev->hcntrl  = dev->eisa ? PAUSE : (PAUSE | CHIPRST);
+    /* HCNTRL comes up with PAUSE and CHIPRESETACK both set -- the data
+       book gives (1) as the reset value of each -- and the acknowledgement
+       "will remain set until explicitly cleared by a write to this
+       register". A driver resetting the part polls for it, so reading it
+       back clear leaves one waiting. */
+    dev->hcntrl  = PAUSE | CHIPRST;
     dev->haddr   = 0;
     dev->hcnt    = 0;
     dev->scbptr  = 0;
@@ -3575,6 +3729,20 @@ aic_init(const device_t *info)
 
     dev->board = info->local & 0xff;
     dev->wide  = (dev->board == BOARD_2940UW) || (dev->board == BOARD_7880);
+    /* An AHA-2740 is one narrow bus. Other members of the family strap the
+       same chip for two buses or for one wide one, and on the AIC-7770
+       those are exclusive: the wide connection takes channel B's data
+       lines for the top half of channel A. */
+    dev->twin  = 0;
+
+    /* The AIC-7770 carries four SCB pages and two four deep queues:
+       SCBPTR selects the page with bits 1:0 and reads back zero above
+       bit 2, QINFIFO and QOUTFIFO hold two bit values, and their counts
+       never pass four. The later parts have sixteen of each. Letting the
+       firmware see more pages than the part has is not a detail -- it
+       decides how it hands work round. */
+    dev->scb_mask = dev->eisa ? 0x03 : (SCB_COUNT - 1);
+    dev->q_depth  = dev->eisa ? 4 : QUEUE_SIZE;
     dev->eisa  = (dev->board == BOARD_2740);
     dev->bus   = scsi_get_bus();
 
@@ -3646,7 +3814,13 @@ aic_init(const device_t *info)
 
         aic_eisa_bios(dev, info);
 
+        /* The four identifier bytes are the chip's own BID0 to BID3 as
+           well as what the slot answers at zC80, and they have to be the
+           same thing: on an AIC-7770 that range is the chip, not the bus
+           logic beside it. */
         eisa_make_id(id, "ADP", 0x7771, 0);
+        memcpy(dev->eisa_id, id, sizeof(dev->eisa_id));
+
         if (!eisa_add(dev->eisa_slot, id, aic_eisa_read, aic_eisa_write,
                       NULL, dev)) {
             aic_log("aic7770: slot %i is not free\n", dev->eisa_slot);
@@ -3709,6 +3883,7 @@ aic_init(const device_t *info)
     timer_add(&dev->seq_timer, aic_seq_timer, dev, 0);
     timer_add(&dev->sel_timer, aic_select_done, dev, 0);
     timer_add(&dev->tgt_timer, aic_tgt_timer, dev, 0);
+    timer_add(&dev->busfree_timer, aic_busfree_timer, dev, 0);
 
     aic_chip_reset(dev);
 
