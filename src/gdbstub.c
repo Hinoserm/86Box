@@ -1934,8 +1934,12 @@ gdbstub_init(void)
     pclog("GDB Stub: Listening on port %d\n", port);
     thread_create(gdbstub_server_thread, NULL);
 
-    /* Start the CPU paused. */
-    gdbstub_step = GDBSTUB_BREAK;
+    /* Start the CPU RUNNING. Upstream starts it paused, which looks
+       exactly like a machine that will not boot: a black screen at 0 Hz
+       until somebody connects a debugger. Attaching still halts it,
+       which is what a hang needs, so nothing is lost by letting it run
+       until then. */
+    gdbstub_step = GDBSTUB_EXEC;
 }
 
 void

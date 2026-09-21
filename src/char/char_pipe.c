@@ -87,8 +87,34 @@ char_pipe_disconnect(char_pipe_t *dev, int fds)
     if (fds && CHAR_FD_VALID(dev->fd)) {
         FlushFileBuffers(dev->fd);
         DisconnectNamedPipe(dev->fd);
-        CloseHandle(dev->fd);
-        dev->fd = INVALID_HANDLE_VALUE;
+
+        /* A server keeps its instance and listens again. Disconnecting alone
+           leaves it existing but not listening, so every later client gets
+           ERROR_PIPE_BUSY until the machine is restarted -- a client that opens
+           the pipe and immediately drops it is enough to wedge the port.
+
+           Re-listening beats closing and recreating, which races the old
+           instance's teardown; with FILE_FLAG_FIRST_PIPE_INSTANCE, losing that
+           race leaves no pipe at all.
+
+           fds is 3 when the port is closing for good, which really does close. */
+        if ((fds != 3) && dev->server && dev->reconnect) {
+            dev->connected = 0;
+
+            if (!ConnectNamedPipe(dev->fd, NULL)) {
+                DWORD listen_err = GetLastError();
+                if (listen_err == ERROR_PIPE_CONNECTED)
+                    dev->connected = 1;
+                else if (listen_err != ERROR_PIPE_LISTENING) {
+                    char_pipe_log(dev->log, "Re-listen failed (%08X)\n", listen_err);
+                    CloseHandle(dev->fd);
+                    dev->fd = INVALID_HANDLE_VALUE;
+                }
+            }
+        } else {
+            CloseHandle(dev->fd);
+            dev->fd = INVALID_HANDLE_VALUE;
+        }
     }
 
     int prev           = dev->block_connect;
@@ -146,9 +172,25 @@ char_pipe_connect(char_pipe_t *dev, int startup)
     char  fmt[512];
     DWORD create_err = 0;
     if (dev->mode != CHAR_PIPE_MODE_CLIENT) {
-        dev->fd = CreateNamedPipeA(dev->path, PIPE_ACCESS_DUPLEX | FILE_FLAG_FIRST_PIPE_INSTANCE, PIPE_TYPE_BYTE | PIPE_READMODE_BYTE | PIPE_NOWAIT, 1, 65536, 65536, NMPWAIT_USE_DEFAULT_WAIT, NULL);
+        dev->fd = CreateNamedPipeA(dev->path, PIPE_ACCESS_DUPLEX | FILE_FLAG_FIRST_PIPE_INSTANCE, PIPE_TYPE_BYTE | PIPE_READMODE_BYTE | PIPE_NOWAIT, PIPE_UNLIMITED_INSTANCES, 65536, 65536, NMPWAIT_USE_DEFAULT_WAIT, NULL);
         if (CHAR_FD_VALID(dev->fd)) {
             char_pipe_log(dev->log, "Created new pipe: %s\n", dev->path);
+
+            /* An instance that has not been passed to ConnectNamedPipe is not
+               listening, and every client opening it gets ERROR_PIPE_BUSY even
+               though nothing is connected.
+
+               In PIPE_NOWAIT mode the call always returns FALSE: ERROR_PIPE_LISTENING
+               means it is now waiting for a client, ERROR_PIPE_CONNECTED means one
+               arrived in between. Both are success. */
+            if (!ConnectNamedPipe(dev->fd, NULL)) {
+                DWORD listen_err = GetLastError();
+                if ((listen_err != ERROR_PIPE_LISTENING) && (listen_err != ERROR_PIPE_CONNECTED))
+                    char_pipe_log(dev->log, "ConnectNamedPipe failed (%08X)\n", listen_err);
+                else if (listen_err == ERROR_PIPE_CONNECTED)
+                    dev->connected = 1;
+            }
+
             dev->block_connect = !dev->reconnect;
             dev->server        = 1;
         } else {

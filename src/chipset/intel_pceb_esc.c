@@ -56,6 +56,10 @@
 #include <86box/port_92.h>
 #include <86box/eisa.h>
 #include <86box/esc.h>
+#include <86box/nvr.h>
+#include <86box/machine.h>
+#include <86box/nvr.h>
+#include <86box/machine.h>
 #include <86box/plat_unused.h>
 
 #ifdef ENABLE_ESC_LOG
@@ -86,6 +90,16 @@ typedef struct esc_t {
 
     uint8_t board_id[4];
 
+    /* The EISA configuration RAM: thirty-two pages of two hundred and
+       fifty-six bytes, seen through a window at 0800h with the page
+       chosen by CONFRAMP at 0C00h. This is where the configuration
+       utility leaves what it worked out and where the BIOS looks at
+       every power on, so it has to outlive the machine. */
+    uint8_t cram[ESC_CRAM_PAGES * 256];
+    uint8_t cram_page;
+    uint8_t cram_auto; /* rebuild it from what is plugged in */
+    char    cram_file[128];
+
     port_92_t *port_92;
 } esc_t;
 
@@ -96,6 +110,118 @@ typedef struct pceb_t {
 } pceb_t;
 
 static esc_t *esc_inst = NULL;
+
+/* ------------------------------------------------------------------ */
+/* The EISA configuration RAM                                          */
+/* ------------------------------------------------------------------ */
+
+/* A configuration record as the utility and the BIOS both understand it:
+   the four identifier bytes, a byte saying the slot is in use and what
+   kind of board it is, and then the function records. Firmware checks
+   the identifier against what the slot actually answers, which is why
+   generating this from the machine rather than from a file is safe --
+   the two cannot disagree. */
+static void
+esc_cram_checksum(uint8_t *page)
+{
+    uint16_t sum = 0;
+
+    /* The sum over the record, excluding the two checksum bytes, is what
+       the BIOS compares against. */
+    page[2] = page[3] = 0;
+    for (uint16_t i = 0; i < 256; i++)
+        sum = (uint16_t) (sum + page[i]);
+    sum     = (uint16_t) (0 - sum);
+    page[2] = (uint8_t) (sum & 0xff);
+    page[3] = (uint8_t) (sum >> 8);
+}
+
+/* Build the configuration from the machine as it stands. Slot zero is the
+   board itself; the rest are whatever answered when the bus was walked. */
+static void
+esc_cram_generate(esc_t *dev)
+{
+    memset(dev->cram, 0, sizeof(dev->cram));
+
+    for (uint8_t slot = 0; slot <= EISA_MAX_SLOTS; slot++) {
+        uint8_t *page = &dev->cram[slot * 256];
+        uint8_t  present;
+
+        if (slot >= ESC_CRAM_PAGES)
+            break;
+
+        present = (slot == 0) ? 1 : eisa_slot_occupied(slot);
+
+        if (!present) {
+            /* An empty slot is recorded as empty, not left as rubbish:
+               the BIOS reads every page. */
+            memset(page, 0, 256);
+            page[0] = page[1] = 0xff;
+            esc_cram_checksum(page);
+            continue;
+        }
+
+        if (slot == 0)
+            memcpy(page, dev->board_id, 4);
+        else {
+            for (uint8_t i = 0; i < 4; i++)
+                page[i + 0] = eisa_slot_id(slot, i);
+        }
+
+        /* Byte four says the slot is occupied and by what: the top two
+           bits are the board type, and the rest of the record is the
+           function list, which is empty because nothing here needs the
+           utility to have allocated anything. */
+        page[4] = 0x01;
+        page[5] = 0x00; /* no function records */
+
+        esc_cram_checksum(page);
+    }
+
+    esc_log("ESC: configuration RAM generated\n");
+}
+
+static void
+esc_cram_load(esc_t *dev)
+{
+    FILE *fp;
+
+    if (dev->cram_auto) {
+        esc_cram_generate(dev);
+        return;
+    }
+
+    fp = nvr_fopen(dev->cram_file, "rb");
+    if (fp == NULL) {
+        /* Nothing saved yet, so start from what the machine says and let
+           the utility take it from there. */
+        esc_cram_generate(dev);
+        return;
+    }
+
+    if (fread(dev->cram, 1, sizeof(dev->cram), fp) != sizeof(dev->cram))
+        esc_cram_generate(dev);
+    fclose(fp);
+}
+
+static void
+esc_cram_save(esc_t *dev)
+{
+    FILE *fp;
+
+    /* Generated configuration is not written back: it is rebuilt from the
+       machine every time, and saving it would let a stale file outlive a
+       change of cards. */
+    if (dev->cram_auto)
+        return;
+
+    fp = nvr_fopen(dev->cram_file, "wb");
+    if (fp == NULL)
+        return;
+
+    fwrite(dev->cram, 1, sizeof(dev->cram), fp);
+    fclose(fp);
+}
 
 /* ------------------------------------------------------------------ */
 /* The board identifier                                               */
@@ -342,6 +468,14 @@ esc_write(uint16_t port, uint8_t val, void *priv)
             }
             break;
 
+        case 0x0c00: /* CONFRAMP, which page of the configuration RAM */
+            dev->cram_page = val & 0x1f;
+            break;
+
+        case 0x0800 ... 0x08ff: /* the configuration RAM itself */
+            dev->cram[(dev->cram_page * 256) + (port & 0xff)] = val;
+            break;
+
         case 0x0c80: /* the board identifier is read only from here */
         case 0x0c81:
         case 0x0c82:
@@ -366,6 +500,12 @@ esc_read(uint16_t port, void *priv)
 
         case 0x0461:
             return dev->nmi_esc;
+
+        case 0x0c00:
+            return dev->cram_page;
+
+        case 0x0800 ... 0x08ff:
+            return dev->cram[(dev->cram_page * 256) + (port & 0xff)];
 
         case 0x0464:
             /* Which EISA master was granted the bus last. Nothing here
@@ -427,6 +567,8 @@ esc_close(void *priv)
 {
     esc_t *dev = (esc_t *) priv;
 
+    esc_cram_save(dev);
+
     if (esc_inst == dev)
         esc_inst = NULL;
     free(dev);
@@ -465,11 +607,41 @@ esc_init(UNUSED(const device_t *info))
                   dev);
     io_sethandler(0x0c80, 0x0004, esc_read, NULL, NULL, esc_write, NULL, NULL,
                   dev);
+    io_sethandler(0x0800, 0x0100, esc_read, NULL, NULL, esc_write, NULL, NULL,
+                  dev);
+    io_sethandler(0x0c00, 0x0001, esc_read, NULL, NULL, esc_write, NULL, NULL,
+                  dev);
+
+    dev->cram_auto = (uint8_t) device_get_config_int("cram_auto");
+    snprintf(dev->cram_file, sizeof(dev->cram_file), "%s_eisa.nvr",
+             machine_get_internal_name());
+    esc_cram_load(dev);
 
     esc_reset_hard(dev);
 
     return dev;
 }
+
+static const device_config_t esc_config[] = {
+    // clang-format off
+    {
+        .name           = "cram_auto",
+        .description    = "EISA configuration",
+        .type           = CONFIG_SELECTION,
+        .default_string = NULL,
+        .default_int    = 1,
+        .file_filter    = NULL,
+        .spinner        = { 0 },
+        .selection      = {
+            { .description = "Automatic",                                 .value = 1 },
+            { .description = "Manual (EISA configuration utility)",       .value = 0 },
+            { .description = ""                                                      }
+        },
+        .bios           = { { 0 } }
+    },
+    { .name = "", .description = "", .type = CONFIG_END }
+    // clang-format on
+};
 
 const device_t esc_device = {
     .name          = "Intel 82374SB (ESC)",
@@ -482,7 +654,7 @@ const device_t esc_device = {
     .available     = NULL,
     .speed_changed = NULL,
     .force_redraw  = NULL,
-    .config        = NULL
+    .config        = esc_config
 };
 
 /* ------------------------------------------------------------------ */

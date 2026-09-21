@@ -43,5 +43,6 @@ target_link_libraries(86Box PkgConfig::SNDFILE)
 
 if (WIN32)
     # MSYS2
-    target_link_libraries(86Box -static ${SNDFILE_STATIC_LIBRARIES})
+    # cross-build: dynamic link, DLLs shipped alongside
+    # target_link_libraries(86Box -static ${SNDFILE_STATIC_LIBRARIES})
 endif()

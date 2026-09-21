@@ -22,6 +22,9 @@
 #define ESC_CONF_DATA  0x0023
 #define ESC_UNLOCK_KEY 0x0f
 
+/* Thirty-two pages of configuration RAM, one per slot and then some. */
+#define ESC_CRAM_PAGES 32
+
 extern const device_t esc_device;  /* 82374SB */
 extern const device_t pceb_device; /* 82375SB */
 

@@ -3222,10 +3222,9 @@ save_general(void)
     else
         ini_section_delete_var(cat, "uuid");
 
-    if (gdbstub_port == 12345)
-        ini_section_delete_var(cat, "gdbstub_port");
-    else
-        ini_section_set_int(cat, "gdbstub_port", gdbstub_port);
+    /* Always written, including the default: deleting it meant that
+       changing any setting in the GUI silently dropped the line. */
+    ini_section_set_int(cat, "gdbstub_port", gdbstub_port);
 
     ini_delete_section_if_empty(config, cat);
 }
