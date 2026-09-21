@@ -97,7 +97,9 @@ typedef struct esc_t {
        every power on, so it has to outlive the machine. */
     uint8_t cram[ESC_CRAM_PAGES * 256];
     uint8_t cram_page;
-    uint8_t cram_auto; /* rebuild it from what is plugged in */
+    uint8_t cram_auto; /* rebuild it when the cards change */
+    uint8_t cram_sig[(EISA_MAX_SLOTS + 1) * 4];   /* what the file was written for */
+    uint8_t cram_checked;                         /* the cards have been looked at */
     char    cram_file[128];
 
     port_92_t *port_92;
@@ -120,7 +122,8 @@ static esc_t *esc_inst = NULL;
    kind of board it is, and then the function records. Firmware checks
    the identifier against what the slot actually answers, which is why
    generating this from the machine rather than from a file is safe --
-   the two cannot disagree. */
+   the two cannot disagree. This is only the starting point: once the
+   BIOS or the utility has written the store, what they wrote is kept. */
 static void
 esc_cram_checksum(uint8_t *page)
 {
@@ -182,26 +185,76 @@ esc_cram_generate(esc_t *dev)
 }
 
 static void
+esc_cram_signature(const esc_t *dev, uint8_t *sig)
+{
+    memcpy(sig, dev->board_id, 4);
+
+    for (uint8_t slot = 1; slot <= EISA_MAX_SLOTS; slot++) {
+        uint8_t *ent = sig + (slot * 4);
+
+        if (eisa_slot_occupied(slot))
+            for (uint8_t i = 0; i < 4; i++)
+                ent[i] = eisa_slot_id(slot, i);
+        else
+            memset(ent, 0xff, 4);
+    }
+}
+
+static void
 esc_cram_load(esc_t *dev)
 {
     FILE *fp;
 
-    if (dev->cram_auto) {
-        esc_cram_generate(dev);
-        return;
-    }
-
     fp = nvr_fopen(dev->cram_file, "rb");
     if (fp == NULL) {
-        /* Nothing saved yet, so start from what the machine says and let
-           the utility take it from there. */
+        /* Nothing saved yet. */
         esc_cram_generate(dev);
         return;
     }
 
-    if (fread(dev->cram, 1, sizeof(dev->cram), fp) != sizeof(dev->cram))
+    if (fread(dev->cram, 1, sizeof(dev->cram), fp) != sizeof(dev->cram)) {
+        fclose(fp);
         esc_cram_generate(dev);
+        return;
+    }
+
+    /* The set of cards the file was written for is kept after the pages.
+       Nothing but us reads it: the window is only ever 8 KB wide, so the
+       guest never sees it. */
+    memset(dev->cram_sig, 0x00, sizeof(dev->cram_sig));
+    if (fread(dev->cram_sig, 1, sizeof(dev->cram_sig), fp) !=
+        sizeof(dev->cram_sig))
+        memset(dev->cram_sig, 0x00, sizeof(dev->cram_sig));
+
     fclose(fp);
+}
+
+/* The cards are plugged in after the chip set is built, so what is in the
+   slots cannot be known at init. The first look at the configuration RAM
+   is late enough, and the BIOS does not touch it before then. */
+static void
+esc_cram_verify(esc_t *dev)
+{
+    uint8_t sig[(EISA_MAX_SLOTS + 1) * 4];
+
+    if (dev->cram_checked)
+        return;
+    dev->cram_checked = 1;
+
+    esc_cram_signature(dev, sig);
+
+    /* Manual mode keeps whatever is in the file, the way a real board keeps
+       whatever the utility last wrote. Automatic mode keeps it too, right
+       up until the cards change: then it is thrown away, so the BIOS finds
+       an empty store and asks for the utility -- exactly what a real board
+       does when someone opens it up and moves a card. */
+    if (dev->cram_auto && memcmp(dev->cram_sig, sig, sizeof(sig))) {
+        esc_log("ESC: the cards have changed, starting the configuration "
+                "RAM again\n");
+        esc_cram_generate(dev);
+    }
+
+    memcpy(dev->cram_sig, sig, sizeof(sig));
 }
 
 static void
@@ -209,17 +262,16 @@ esc_cram_save(esc_t *dev)
 {
     FILE *fp;
 
-    /* Generated configuration is not written back: it is rebuilt from the
-       machine every time, and saving it would let a stale file outlive a
-       change of cards. */
-    if (dev->cram_auto)
-        return;
+    /* If the guest never looked at the store the signature is still the
+       one the file came with, which is what should go back. */
+    esc_cram_verify(dev);
 
     fp = nvr_fopen(dev->cram_file, "wb");
     if (fp == NULL)
         return;
 
     fwrite(dev->cram, 1, sizeof(dev->cram), fp);
+    fwrite(dev->cram_sig, 1, sizeof(dev->cram_sig), fp);
     fclose(fp);
 }
 
@@ -473,6 +525,7 @@ esc_write(uint16_t port, uint8_t val, void *priv)
             break;
 
         case 0x0800 ... 0x08ff: /* the configuration RAM itself */
+            esc_cram_verify(dev);
             esc_log("ESC: cram wr %02x:%02x = %02x\n", dev->cram_page,
                     port & 0xff, val);
             dev->cram[(dev->cram_page * 256) + (port & 0xff)] = val;
@@ -507,6 +560,7 @@ esc_read(uint16_t port, void *priv)
             return dev->cram_page;
 
         case 0x0800 ... 0x08ff:
+            esc_cram_verify(dev);
             esc_log("ESC: cram rd %02x:%02x = %02x\n", dev->cram_page,
                     port & 0xff,
                     dev->cram[(dev->cram_page * 256) + (port & 0xff)]);
@@ -639,8 +693,8 @@ static const device_config_t esc_config[] = {
         .file_filter    = NULL,
         .spinner        = { 0 },
         .selection      = {
-            { .description = "Automatic",                                 .value = 1 },
-            { .description = "Manual (EISA configuration utility)",       .value = 0 },
+            { .description = "Automatic (start again when the cards change)", .value = 1 },
+            { .description = "Manual (EISA configuration utility)",           .value = 0 },
             { .description = ""                                                      }
         },
         .bios           = { { 0 } }
