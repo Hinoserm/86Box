@@ -69,6 +69,8 @@
 #include <86box/nmc93cxx.h>
 #include <86box/scsi.h>
 #include <86box/scsi_device.h>
+#include <86box/pic.h>
+#include <86box/eisa.h>
 #include <86box/scsi_aic7880.h>
 #include <86box/plat_unused.h>
 
@@ -206,6 +208,17 @@ aic_log(const char *fmt, ...)
 
 #define SRAM_BASE    0x20 /* scratch RAM, to 0x5f */
 
+/* On an EISA part the top of scratch is where the configuration chip
+   appears, and the driver reads its settings from there. These are not
+   scratch to us: a chip reset must leave them as the configuration left
+   them, which is what the real card does. */
+#define HA_274_BIOSGLOBAL 0x56 /* bit 0: extended translation */
+#define SCSICONF          0x5a /* terminators, parity, and our own ID */
+#define SCSICONF_B        0x5b
+#define INTDEF            0x5c /* bit 7 edge triggered, bits 3:0 the IRQ */
+#define HOSTCONF          0x5d /* FIFO threshold and bus off time */
+#define HA_274_BIOSCTRL   0x5f /* bits 5:4: 3 means the BIOS is disabled */
+
 #define SEQCTL       0x60
 #define PERRORDIS    0x80
 #define PAUSEDIS     0x40
@@ -239,6 +252,11 @@ aic_log(const char *fmt, ...)
 #define DSCOMMAND0   0x84
 #define DSCOMMAND1   0x85
 #define DSPCISTATUS  0x86
+/* The same three addresses on an AIC-7770, which has a bus of its own to
+   look after rather than a PCI one. */
+#define BCTL         0x84 /* bit 0 enables the board's bus drivers */
+#define BUSTIME      0x85
+#define BUSSPD       0x86
 #define DFTHRSH_100  0xc0
 #define HCNTRL       0x87
 #define POWRDN       0x40
@@ -352,6 +370,7 @@ typedef struct aic7880_t {
     /* PCI side */
     uint8_t       pci_slot;
     uint8_t       irq_state; /* belongs to the PCI layer */
+    uint8_t       irq;       /* the EISA board's own interrupt */
     uint8_t       irq_level; /* what we last drove */
     uint8_t       pci_regs[256];
     uint16_t      io_base;
@@ -449,6 +468,16 @@ typedef struct aic7880_t {
     uint8_t  scbcnt;
     uint8_t  sfunct;
 
+    /* The EISA part. Its settings come from the configuration chip rather
+       than a serial EEPROM, and a chip reset does not disturb them. */
+    uint8_t  eisa;
+    uint8_t  eisa_slot;
+    uint8_t  eisa_conf[6]; /* 5a, 5b, 5c, 5d, 5e, 5f */
+    uint8_t  eisa_global;  /* 56 */
+    uint8_t  bctl;
+    uint8_t  bustime;
+    uint8_t  busspd;
+
     uint8_t  fifo[FIFO_SIZE];
     uint16_t fifo_rd;
     uint16_t fifo_cnt;
@@ -543,12 +572,29 @@ aic_update_irq(aic7880_t *dev)
 
     /* INTEN gates everything, SWINT included, and so do bus mastering in
        the PCI command register and POWRDN. */
-    fire = (dev->hcntrl & INTEN) && !(dev->hcntrl & POWRDN) && (dev->pci_regs[0x04] & 0x04) && (pend || (dev->hcntrl & SWINT));
+    /* Bus mastering in the PCI command register is one of the gates on a
+       PCI part. The EISA board has the same gate in BCTL, which is what
+       the driver sets last of all once it is ready to be interrupted. */
+    if (dev->eisa)
+        fire = (dev->hcntrl & INTEN) && !(dev->hcntrl & POWRDN) &&
+               (dev->bctl & 0x01) && (pend || (dev->hcntrl & SWINT));
+    else
+        fire = (dev->hcntrl & INTEN) && !(dev->hcntrl & POWRDN) && (dev->pci_regs[0x04] & 0x04) && (pend || (dev->hcntrl & SWINT));
 
     if (fire == dev->irq_level)
         return;
     dev->irq_level = fire;
     aic_log("irq %s intstat %02x\n", fire ? "high" : "low", dev->intstat);
+
+    if (dev->eisa) {
+        /* The 274x is a level triggered board. */
+        if (fire)
+            picintlevel(1 << dev->irq, &dev->irq_state);
+        else
+            picintclevel(1 << dev->irq, &dev->irq_state);
+        return;
+    }
+
     if (fire)
         pci_set_irq(dev->pci_slot, PCI_INTA, &dev->irq_state);
     else
@@ -1819,7 +1865,9 @@ aic_read(aic7880_t *dev, uint8_t addr, int seq)
                the sequencer, which has nothing else -- tells the parts of
                the family apart here. */
             return dev->pci_regs[addr - DSVENDID];
-        case DSCOMMAND0:
+        case DSCOMMAND0: /* BCTL on the EISA part */
+            if (dev->eisa)
+                return dev->bctl;
             /* The low four bits are SERRESPEN, PERRESPEN, MWRICEN and
                MASTEREN out of the PCI command register. */
             ret = dev->dscommand0 & 0xf0;
@@ -1832,10 +1880,14 @@ aic_read(aic7880_t *dev, uint8_t addr, int seq)
             if (dev->pci_regs[0x04] & 0x04)
                 ret |= 0x01;
             return ret;
-        case DSCOMMAND1:
+        case DSCOMMAND1: /* BUSTIME on the EISA part */
+            if (dev->eisa)
+                return dev->bustime;
             /* The latency timer, over HADDLDSEL. */
             return (dev->pci_regs[0x0d] & 0xfc) | (dev->dscommand1 & 0x03);
-        case DSPCISTATUS:
+        case DSPCISTATUS: /* BUSSPD on the EISA part */
+            if (dev->eisa)
+                return dev->busspd;
             return dev->dspcistatus;
         case HCNTRL:
             ret = dev->hcntrl & ~PAUSE;
@@ -2178,12 +2230,24 @@ aic_write(aic7880_t *dev, uint8_t addr, uint8_t val, int seq)
             break;
 
         case DSCOMMAND0:
+            if (dev->eisa) {
+                dev->bctl = val & 0x09;
+                break;
+            }
             dev->dscommand0 = val & 0xf0;
             break;
         case DSCOMMAND1:
+            if (dev->eisa) {
+                dev->bustime = val;
+                break;
+            }
             dev->dscommand1 = val & 0x03;
             break;
         case DSPCISTATUS:
+            if (dev->eisa) {
+                dev->busspd = val;
+                break;
+            }
             /* Only the FIFO threshold select can be written. */
             dev->dspcistatus = val & DFTHRSH_100;
             aic_pump(dev);
@@ -2196,10 +2260,13 @@ aic_write(aic7880_t *dev, uint8_t addr, uint8_t val, int seq)
             was         = dev->hcntrl;
             dev->hcntrl = val & ~CHIPRST;
             if (val & CHIPRST) {
-                /* A chip reset from the host; CHIPRSTACK reads back in
-                   the same bit to say it happened. */
+                /* A chip reset from the host. On the later parts the same
+                   bit reads back as CHIPRSTACK to say it happened; the
+                   AIC-7770 has no such acknowledgement and the bit simply
+                   reads back clear, which is what its drivers expect. */
                 aic_chip_reset(dev);
-                dev->hcntrl |= CHIPRST;
+                if (!dev->eisa)
+                    dev->hcntrl |= CHIPRST;
                 return;
             }
             /* SWINT drives the interrupt pin and nothing else: it is how
@@ -2836,7 +2903,7 @@ aic_chip_reset(aic7880_t *dev)
     dev->dspcistatus = 0;
     /* CHIPRSTACK reads back in the same bit as CHIPRST, and says the
        part has not been touched since it was reset. */
-    dev->hcntrl  = PAUSE | CHIPRST;
+    dev->hcntrl  = dev->eisa ? PAUSE : (PAUSE | CHIPRST);
     dev->haddr   = 0;
     dev->hcnt    = 0;
     dev->scbptr  = 0;
@@ -2851,6 +2918,20 @@ aic_chip_reset(aic7880_t *dev)
     dev->qin_cnt = dev->qout_cnt = 0;
 
     memset(dev->sram, 0, sizeof(dev->sram));
+
+    /* The configuration chip is mapped over the top of scratch on an EISA
+       board, so what it holds outlives a chip reset. */
+    if (dev->eisa) {
+        memcpy(&dev->sram[SCSICONF - SRAM_BASE], dev->eisa_conf,
+               sizeof(dev->eisa_conf));
+        dev->sram[HA_274_BIOSGLOBAL - SRAM_BASE] = dev->eisa_global;
+
+        /* A board the configuration utility has enabled comes up with its
+           bus drivers on. The driver reads this before anything else and
+           walks past a slot that reads back disabled. */
+        dev->bctl = 0x01;
+    }
+
     memset(dev->scb, 0, sizeof(dev->scb));
     memset(dev->misc, 0, sizeof(dev->misc));
 
@@ -2930,6 +3011,33 @@ aic_seeprom_build(const aic7880_t *dev, uint16_t *nvr)
 }
 
 /* ---- the register window ------------------------------------------------ */
+
+/* The EISA part answers in the last of its slot's four ranges, at zC00,
+   with the register number in the low byte. The four bytes at zC80 are the
+   product identifier and the bus serves those itself. */
+static uint8_t
+aic_eisa_read(uint16_t port, void *priv)
+{
+    aic7880_t *dev = (aic7880_t *) priv;
+    uint8_t    reg = (uint8_t) (port & 0xff);
+
+    if ((port & 0x0f00) != 0x0c00)
+        return 0xff;
+
+    return aic_read(dev, reg, 0);
+}
+
+static void
+aic_eisa_write(uint16_t port, uint8_t val, void *priv)
+{
+    aic7880_t *dev = (aic7880_t *) priv;
+    uint8_t    reg = (uint8_t) (port & 0xff);
+
+    if ((port & 0x0f00) != 0x0c00)
+        return;
+
+    aic_write(dev, reg, val, 0);
+}
 
 static uint8_t
 aic_io_readb(uint16_t port, void *priv)
@@ -3210,6 +3318,7 @@ aic_pci_write(int func, int addr, UNUSED(int len), uint8_t val, void *priv)
 #define BOARD_7880         0 /* the chip on a motherboard */
 #define BOARD_2940U        1 /* AHA-2940 Ultra, narrow */
 #define BOARD_2940UW       2 /* AHA-2940 Ultra Wide */
+#define BOARD_2740         3 /* AHA-2740, an AIC-7770 on EISA */
 
 static void
 aic_reset(void *priv)
@@ -3230,6 +3339,7 @@ aic_init(const device_t *info)
 
     dev->board = info->local & 0xff;
     dev->wide  = (dev->board == BOARD_2940UW) || (dev->board == BOARD_7880);
+    dev->eisa  = (dev->board == BOARD_2740);
     dev->bus   = scsi_get_bus();
 
     scsi_bus_set_speed(dev->bus, 20000000.0);
@@ -3281,12 +3391,44 @@ aic_init(const device_t *info)
        The part on a motherboard has no settings and does without. */
     dev->timed_dev = (dev->board == BOARD_7880) ? 0 : device_get_config_int("dev_timing");
 
+    if (dev->eisa) {
+        static const uint8_t irqs[8] = { 9, 10, 11, 12, 14, 15, 11, 11 };
+        uint8_t              id[4];
+        uint8_t              irq;
+
+        dev->eisa_slot = (uint8_t) device_get_config_int("slot");
+        irq            = irqs[device_get_config_int("irq") & 0x07];
+
+        /* What the configuration utility writes and the driver reads back:
+           our own identifier with the terminators on, the interrupt it was
+           given, level triggered as the 274x is, a middling FIFO threshold
+           and bus off time, and a BIOS that is present so the driver takes
+           the identifier from here rather than falling back to seven. */
+        dev->eisa_conf[SCSICONF - SCSICONF]   = 0x80 | 0x20 | 0x07;
+        dev->eisa_conf[SCSICONF_B - SCSICONF] = 0x80 | 0x20 | 0x07;
+        dev->eisa_conf[INTDEF - SCSICONF]     = irq & 0x0f;
+        dev->eisa_conf[HOSTCONF - SCSICONF]   = 0x2d;
+        dev->eisa_conf[0x5e - SCSICONF]       = 0x00;
+        dev->eisa_conf[HA_274_BIOSCTRL - SCSICONF] = 0x10;
+        dev->eisa_global                           = 0x01;
+
+        dev->irq = irq;
+
+        eisa_make_id(id, "ADP", 0x7771, 0);
+        if (!eisa_add(dev->eisa_slot, id, aic_eisa_read, aic_eisa_write,
+                      NULL, dev)) {
+            aic_log("aic7770: slot %i is not free\n", dev->eisa_slot);
+            free(dev);
+            return NULL;
+        }
+    }
+
     /* The card's own BIOS. Every one of these images is an AHA-2940
        Ultra/Ultra W BIOS whose PCI data structure names 9004:8178, as this
        card does; the PCI BIOS refuses to run one whose ID does not match.
        The images are shorter than the 64 KiB window the BAR asks for, and
        what is not covered by the file reads back as 0xff. */
-    if ((dev->board != BOARD_7880) && device_get_config_int("bios")) {
+    if ((dev->board != BOARD_7880) && !dev->eisa && device_get_config_int("bios")) {
         const char *bios_rev  = device_get_config_bios("bios_rev");
         const char *bios_path = device_get_bios_file(info, bios_rev, 0);
         int         ok;
@@ -3305,6 +3447,9 @@ aic_init(const device_t *info)
         }
     }
 
+    /* An EISA board has no serial EEPROM: the configuration chip at the
+       top of scratch is where its settings live. */
+    if (!dev->eisa) {
     aic_seeprom_build(dev, nvr);
     snprintf(fn, sizeof(fn), "nmc93cxx_eeprom_%s_%d.nvr", info->internal_name,
              device_get_instance());
@@ -3318,6 +3463,7 @@ aic_init(const device_t *info)
         free(dev);
         return NULL;
     }
+    }
 
     mem_mapping_add(&dev->mmio, 0, 0, aic_mem_readb, aic_mem_readw, aic_mem_readl,
                     aic_mem_writeb, aic_mem_writew, aic_mem_writel, NULL,
@@ -3330,7 +3476,9 @@ aic_init(const device_t *info)
 
     aic_chip_reset(dev);
 
-    pci_add_card(PCI_ADD_NORMAL, aic_pci_read, aic_pci_write, dev, &dev->pci_slot);
+    if (!dev->eisa)
+        pci_add_card(PCI_ADD_NORMAL, aic_pci_read, aic_pci_write, dev,
+                     &dev->pci_slot);
 
     aic_log("aic7880: board %i, %s, bus %i\n", dev->board,
             dev->wide ? "wide" : "narrow", dev->bus);
@@ -3357,6 +3505,59 @@ aic_close(void *priv)
 
     free(dev);
 }
+
+static const device_config_t aic7770_config[] = {
+    // clang-format off
+    {
+        .name           = "slot",
+        .description    = "EISA slot",
+        .type           = CONFIG_SELECTION,
+        .default_string = NULL,
+        .default_int    = 1,
+        .file_filter    = NULL,
+        .spinner        = { 0 },
+        .selection      = {
+            { .description = "Slot 1", .value = 1 },
+            { .description = "Slot 2", .value = 2 },
+            { .description = "Slot 3", .value = 3 },
+            { .description = "Slot 4", .value = 4 },
+            { .description = ""                   }
+        },
+        .bios           = { { 0 } }
+    },
+    {
+        .name           = "irq",
+        .description    = "IRQ",
+        .type           = CONFIG_SELECTION,
+        .default_string = NULL,
+        .default_int    = 1,
+        .file_filter    = NULL,
+        .spinner        = { 0 },
+        .selection      = {
+            { .description = "IRQ 9",  .value = 0 },
+            { .description = "IRQ 10", .value = 1 },
+            { .description = "IRQ 11", .value = 2 },
+            { .description = "IRQ 12", .value = 3 },
+            { .description = "IRQ 14", .value = 4 },
+            { .description = "IRQ 15", .value = 5 },
+            { .description = ""                   }
+        },
+        .bios           = { { 0 } }
+    },
+    {
+        .name           = "dev_timing",
+        .description    = "Model device access times",
+        .type           = CONFIG_BINARY,
+        .default_string = NULL,
+        .default_int    = 0,
+        .file_filter    = NULL,
+        .spinner        = { 0 },
+        .selection      = { { 0 } },
+        .bios           = { { 0 } }
+    },
+    { .name = "", .description = "", .type = CONFIG_END }
+    // clang-format on
+};
 
 static const device_config_t aic_card_config[] = {
     // clang-format off
@@ -3448,6 +3649,20 @@ const device_t aic7880_pci_device = {
     .speed_changed = NULL,
     .force_redraw  = NULL,
     .config        = NULL
+};
+
+const device_t aha2740_device = {
+    .name          = "Adaptec AHA-2740",
+    .internal_name = "aha2740",
+    .flags         = DEVICE_EISA,
+    .local         = BOARD_2740,
+    .init          = aic_init,
+    .close         = aic_close,
+    .reset         = aic_reset,
+    .available     = NULL,
+    .speed_changed = NULL,
+    .force_redraw  = NULL,
+    .config        = aic7770_config
 };
 
 const device_t aha2940u_pci_device = {
