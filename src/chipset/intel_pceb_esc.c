@@ -89,6 +89,7 @@ typedef struct esc_t {
 
     void   *apm;
     uint8_t cram_decoded;
+    uint8_t port_92_decoded;
 
     uint8_t board_id[4];
     uint8_t embedded_id[4]; /* a device soldered to the board */
@@ -631,28 +632,36 @@ esc_set_board_id(const char *mfg, uint16_t product, uint8_t rev)
 static uint8_t esc_read(uint16_t port, void *priv);
 static void    esc_write(uint16_t port, uint8_t val, void *priv);
 
-/* PCSB bit 7 says whether the configuration RAM window and its page
-   register are decoded at all. */
+/* PCSB says what the part decodes for itself. Bit 7 is the configuration
+   RAM window and its page register, bit 6 is Port 92. */
 static void
 esc_cram_decode(esc_t *dev)
 {
     uint8_t want = !!(dev->regs[0x4f] & 0x80);
+    uint8_t p92  = !!(dev->regs[0x4f] & 0x40);
 
-    if (want == dev->cram_decoded)
-        return;
-    dev->cram_decoded = want;
-
-    if (want) {
-        io_sethandler(0x0800, 0x0100, esc_read, NULL, NULL, esc_write, NULL,
-                      NULL, dev);
-        io_sethandler(0x0c00, 0x0001, esc_read, NULL, NULL, esc_write, NULL,
-                      NULL, dev);
-    } else {
-        io_removehandler(0x0800, 0x0100, esc_read, NULL, NULL, esc_write,
-                         NULL, NULL, dev);
-        io_removehandler(0x0c00, 0x0001, esc_read, NULL, NULL, esc_write,
-                         NULL, NULL, dev);
+    if (p92 != dev->port_92_decoded) {
+        dev->port_92_decoded = p92;
+        if (dev->port_92 != NULL) {
+            if (p92)
+                port_92_add(dev->port_92);
+            else
+                port_92_remove(dev->port_92);
+        }
     }
+
+    /* Bit 7 is not acted on, and the reason is worth writing down. This
+       board's firmware clears it within the first few dozen ESC accesses
+       of POST -- it writes PCSB 7Fh, which also disables the parallel port
+       decode because the Super I/O has that -- and never sets it again. On
+       the real machine that says there is no configuration SRAM behind the
+       ESC at all, which fits its clearing MS bit 5, the page address
+       generation, in the same breath. Honouring the bit therefore takes
+       the configuration RAM away for the whole of the machine's life, and
+       the EISA configuration store is kept in that RAM here. Where the
+       real board keeps its store instead -- the flash, most likely -- is
+       not modelled yet, so the window stays decoded until it is. */
+    (void) want;
 }
 
 static void
@@ -1078,7 +1087,8 @@ esc_init(UNUSED(const device_t *info))
                   dev);
     io_sethandler(0x0c80, 0x0004, esc_read, NULL, NULL, esc_write, NULL, NULL,
                   dev);
-    dev->cram_decoded = 1;
+    dev->cram_decoded    = 1;
+    dev->port_92_decoded = 1;
     io_sethandler(0x0800, 0x0100, esc_read, NULL, NULL, esc_write, NULL, NULL,
                   dev);
     io_sethandler(0x0c00, 0x0001, esc_read, NULL, NULL, esc_write, NULL, NULL,
