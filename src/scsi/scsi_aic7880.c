@@ -206,6 +206,11 @@ aic_log(const char *fmt, ...)
 #define SELBUSB      0x08
 #define SELWIDE      0x02
 
+#define BOARD_7880         0 /* the chip on a motherboard */
+#define BOARD_2940U        1 /* AHA-2940 Ultra, narrow */
+#define BOARD_2940UW       2 /* AHA-2940 Ultra Wide */
+#define BOARD_2740         3 /* AHA-2740, an AIC-7770 on EISA */
+
 #define SRAM_BASE    0x20 /* scratch RAM, to 0x5f */
 
 /* On an EISA part the top of scratch is where the configuration chip
@@ -2964,7 +2969,7 @@ aic_seeprom_build(const aic7880_t *dev, uint16_t *nvr)
     uint16_t sum;
     uint16_t flags;
 
-    for (uint8_t i = 0; i < 64; i++)
+    for (uint16_t i = 0; i < 128; i++)
         nvr[i] = 0xffff;
 
     /* These are not inferred: they are what the AHA-2940UW BIOS v2.20.0
@@ -3004,7 +3009,11 @@ aic_seeprom_build(const aic7880_t *dev, uint16_t *nvr)
         if (half == 0) {
             for (uint8_t i = 20; i < 30; i++)
                 w[i] = 0x0000;
-            w[30] = 0x0250;
+            /* The signature word says "an Adaptec card wrote this". The
+               chip on this motherboard has none, and its firmware does not
+               look for one. */
+            if (dev->board != BOARD_7880)
+                w[30] = 0x0250;
         }
 
         sum = 0;
@@ -3368,10 +3377,6 @@ aic_pci_write(int func, int addr, UNUSED(int len), uint8_t val, void *priv)
 #define AHA2940UW_V220_ROM "roms/scsi/adaptec/aha2940uw_v220.bin"
 #define AHA2740_V210_ROM   "roms/scsi/adaptec/aha2740_v210.bin"
 
-#define BOARD_7880         0 /* the chip on a motherboard */
-#define BOARD_2940U        1 /* AHA-2940 Ultra, narrow */
-#define BOARD_2940UW       2 /* AHA-2940 Ultra Wide */
-#define BOARD_2740         3 /* AHA-2740, an AIC-7770 on EISA */
 
 static void
 aic_reset(void *priv)
@@ -3386,7 +3391,7 @@ aic_init(const device_t *info)
 {
     aic7880_t               *dev = (aic7880_t *) calloc(1, sizeof(aic7880_t));
     nmc93cxx_eeprom_params_t params;
-    uint16_t                 nvr[64];
+    uint16_t                 nvr[128];
     char                     fn[1024] = { 0 };
     uint16_t                 devid;
 
@@ -3509,7 +3514,11 @@ aic_init(const device_t *info)
     aic_seeprom_build(dev, nvr);
     snprintf(fn, sizeof(fn), "nmc93cxx_eeprom_%s_%d.nvr", info->internal_name,
              device_get_instance());
-    params.type            = NMC_93C46_x16_64;
+    /* The cards carry a 93C46. The chip on this motherboard has a 93C56,
+       which is eight address bits rather than six, and a driver that
+       clocks out the wrong number of them reads rubbish. */
+    params.type            = (dev->board == BOARD_7880) ? NMC_93C56_x16_128
+                                                        : NMC_93C46_x16_64;
     params.default_content = nvr;
     params.filename        = fn;
     dev->eeprom            = (nmc93cxx_eeprom_t *) device_add_inst_params(&nmc93cxx_device,

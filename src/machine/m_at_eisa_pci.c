@@ -74,8 +74,11 @@ machine_at_54tdp_init(const machine_t *model)
        it is one. */
     pci_register_slot(0x07, PCI_CARD_SOUTHBRIDGE, 0, 0, 0, 0);
     /* The on-board SCSI, then the four slots. */
-    pci_register_slot(0x08, PCI_CARD_SCSI, 1, 2, 3, 4);
-    pci_register_slot(0x09, PCI_CARD_VIDEO, 2, 3, 4, 1);
+    /* The BIOS only ever routes PIRQC and PIRQD, to IRQ 10 and 11. The
+       on-board SCSI is the one that has to land on a real interrupt, and
+       the board puts it on 10, so its INTA goes to PIRQC. */
+    pci_register_slot(0x08, PCI_CARD_SCSI, 3, 4, 1, 2);
+    pci_register_slot(0x09, PCI_CARD_VIDEO, 4, 1, 2, 3);
     pci_register_slot(0x0a, PCI_CARD_NORMAL, 3, 4, 1, 2);
     pci_register_slot(0x0b, PCI_CARD_NORMAL, 4, 1, 2, 3);
     pci_register_slot(0x0c, PCI_CARD_NORMAL, 1, 2, 3, 4);
