@@ -260,6 +260,23 @@ pceb_bios_timer_remap(pceb_t *dev)
 /* One minute a tick: "The count time interval is one minute." */
 #define ESC_FAST_OFF_TICK (60.0 * 1000000.0)
 
+/* A system event, which is what keeps the machine from powering down:
+   "Anytime the corresponding hardware event occurs (signal is asserted),
+   the Fast Off Timer is re-loaded with its initial count." SEE says which
+   events count, and two of them are the ESC's own -- bit 31 for an SMI,
+   bit 29 for an NMI -- so those are the two this can honour. The rest of
+   the register is Fast Off IRQ[15:3], which wants to see the interrupt
+   lines themselves, and 86Box's interrupt controller offers nowhere to
+   watch them from. SEE is thirty-two bits at A4h, so bit 31 is bit 7 of
+   A7h and bit 29 is bit 5 of it. */
+static void
+esc_system_event(esc_t *dev, uint8_t see_bit)
+{
+    if (!(dev->regs[0xa7] & (1 << (see_bit - 24))))
+        return;
+    dev->fast_off_count = dev->regs[0xa8];
+}
+
 /* An SMI source firing. SMIEN says whether the event is one the part
    watches, SMIREQ records it, and SMICNTL bit 0 decides only whether the
    pin moves: it "does not effect the detection/recording of SMI events
@@ -281,6 +298,9 @@ esc_smi_event(esc_t *dev, uint8_t bit)
 
     esc_log("ESC: SMI source %u\n", bit);
     dev->regs[0xaa] |= mask;
+
+    /* FSMIEN: an SMI is itself activity. */
+    esc_system_event(dev, 31);
 
     if (dev->regs[0xa0] & 0x01)
         smi_raise();
@@ -348,6 +368,8 @@ esc_fail_safe_timer(int new_out, int old_out, UNUSED(void *priv))
     dev->nmi_esc |= 0x80;
     nmi           = 1;
     nmi_auto_clear = 1;
+    /* FNMIEN: and so is an NMI. */
+    esc_system_event(dev, 29);
 }
 
 /* ------------------------------------------------------------------ */
@@ -385,6 +407,7 @@ esc_serr(void)
     dev->serr_nmi  = 1;
     nmi            = 1;
     nmi_auto_clear = 1;
+    esc_system_event(dev, 29);
 }
 
 static void
@@ -1148,6 +1171,7 @@ esc_write(uint16_t port, uint8_t val, void *priv)
             if (dev->nmi_esc & 0x02) {
                 dev->nmi_esc |= 0x20;
                 nmi = 1;
+                esc_system_event(dev, 29);
             }
             break;
 
