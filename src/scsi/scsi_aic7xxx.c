@@ -2272,7 +2272,14 @@ aic_read(aic7xxx_t *dev, uint8_t addr, int seq)
         case SCBCNT:
             return dev->scbcnt;
         case QINFIFO:
-            /* The sequencer takes the next queued SCB. */
+            /* The sequencer takes the next queued SCB. An empty one does
+               not shift -- "reads when QINCNT=0 are ignored" -- and what
+               comes back instead the book does not say, so neither queue
+               is wrong here. They differ on purpose: an SCB number is
+               what these carry, and FFh is the one a driver reads as no
+               SCB at all, which is the useful answer on the queue a
+               driver reads and a meaningless one on the queue only the
+               sequencer reads. */
             if (dev->qin_cnt == 0)
                 return 0;
             ret         = dev->qin[dev->qin_rd];
