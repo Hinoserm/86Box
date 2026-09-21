@@ -146,6 +146,9 @@ static const struct {
     { "KP3",    0x51   }, { "KP4",    0x4b   }, { "KP5",    0x4c   },
     { "KP6",    0x4d   }, { "KP7",    0x47   }, { "KP8",    0x48   },
     { "KP9",    0x49   }, { "KPPLUS", 0x4e   }, { "KPMINUS", 0x4a  },
+    /* The keypad's own Delete. Setup screens of the period often watch for
+       this one rather than the grey key, which arrives with an E0. */
+    { "KPDEL",  0x53   }, { "KPDOT",  0x53   },
     { NULL,     0      }
     // clang-format on
 };
