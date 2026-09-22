@@ -249,6 +249,17 @@ sis_85c411_write411(sis_85c411_t *dev, uint8_t idx, uint8_t val)
     if ((idx < R411_FIRST) || (idx > R411_LAST))
         return;
 
+    /* Bit 6 of 63h says the banks are 16M x 36 parts, 64 MB each, and the
+       BIOS sets it from its defaults and then expects the SIMMs themselves
+       to say otherwise: a smaller part aliases across its top and the
+       sizing code notices. A flat emulated memory never aliases, so the
+       bit would stick and the BIOS would report 64 MB that does not
+       exist -- HIMEM then finds "unreliable XMS memory" at the end of
+       real RAM. So the parts answer here: the bit only holds when the
+       memory fitted needs 64 MB banks. */
+    if ((idx == R411_MISC) && ((mem_size >> 10) < 128))
+        val &= ~0x40;
+
     old                          = dev->regs411[idx - R411_FIRST];
     dev->regs411[idx - R411_FIRST] = val;
     sis_85c411_log("SiS411: [%04X:%08X] reg %02X = %02X\n", CS, cpu_state.pc, idx, val);
@@ -519,6 +530,13 @@ sis_85c411_reset(void *priv)
 
     cpu_cache_ext_enabled = 0;
     cpu_update_waitstates();
+
+    /* The fail-safe counter's gate, which a soft reset leaves wherever the
+       timer had it. */
+    if (pit_devs[1].data != NULL) {
+        pit_devs[1].set_gate(pit_devs[1].data, 0, 1);
+        pit_devs[1].set_gate(pit_devs[1].data, 1, 1);
+    }
 
     dev->force_flush = 1;
     sis_85c411_recalcmapping(dev);
