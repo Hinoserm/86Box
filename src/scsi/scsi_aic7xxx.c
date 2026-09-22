@@ -3892,7 +3892,29 @@ aic_seq_step(aic7xxx_t *dev)
         case OP_ROL:
             a   = aic_read(dev, src, 1);
             res = aic_rotate(a, imm);
-            aic_seq_flags_logic(dev, res);
+            /* The rotate is the one non-arithmetic operation that touches
+               the carry: "For both rotates and shifts, the carry flag is
+               set to the previous bit 7 or bit 0 value after each step of
+               the move" -- bit 7 when the mask is right-justified, bit 0
+               when it is left-justified (shift control bit 3). Firmware
+               builds counts on it: Windows 98's driver does "shl HCNT0,1"
+               and then two adcs to turn a scatter/gather length into a
+               tally of 128-byte pieces, and with the carry left stale the
+               tally was one short whenever bit 7 of the length was set.
+               Reads then left 128 bytes in the target and the firmware
+               reported a data overrun; writes delivered 128 bytes fewer
+               than the drive was told, and said nothing. */
+            {
+                uint8_t steps = imm & 0x07;
+                uint8_t v     = a;
+
+                carry = !!(dev->flags & CARRY);
+                for (uint8_t i = 0; i < steps; i++) {
+                    carry = (imm & 0x08) ? (v & 0x01) : (v >> 7);
+                    v     = (uint8_t) ((v << 1) | (v >> 7));
+                }
+            }
+            aic_seq_flags(dev, res, carry);
             aic_write(dev, dest, res, 1);
             break;
 
