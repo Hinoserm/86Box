@@ -227,7 +227,7 @@ aic_log(const char *tag, const char *fmt, ...)
 #define BOARD_7880         0 /* the chip on a motherboard */
 #define BOARD_2940U        1 /* AHA-2940 Ultra, narrow */
 #define BOARD_2940UW       2 /* AHA-2940 Ultra Wide */
-#define BOARD_2740         3 /* AHA-2740, an AIC-7770 on EISA, one narrow bus */
+#define BOARD_2742        3 /* AHA-2742, an AIC-7770 on EISA, one narrow bus, no floppy */
 
 #define SRAM_BASE    0x20 /* scratch RAM, to 0x5f */
 
@@ -4968,7 +4968,7 @@ aic_init(const device_t *info)
        The two cells are still modelled for a board that has both; what
        decides is the strap, and this card's is one connector. */
 
-    dev->eisa  = (dev->board == BOARD_2740);
+    dev->eisa  = (dev->board == BOARD_2742);
     /* Which part this board is built on, before anything asks. */
     dev->chip  = dev->eisa ? &aic_chip_7770 : &aic_chip_788x;
     dev->bus   = scsi_get_bus();
@@ -5381,11 +5381,11 @@ const device_t aic7880_pci_device = {
     .config        = NULL
 };
 
-const device_t aha2740_device = {
-    .name          = "Adaptec AHA-2740",
-    .internal_name = "aha2740",
+const device_t aha2742_device = {
+    .name          = "Adaptec AHA-2742",
+    .internal_name = "aha2742",
     .flags         = DEVICE_EISA,
-    .local         = BOARD_2740,
+    .local         = BOARD_2742,
     .init          = aic_init,
     .close         = aic_close,
     .reset         = aic_reset,

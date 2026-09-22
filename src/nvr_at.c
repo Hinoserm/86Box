@@ -689,6 +689,18 @@ nvr_write(uint16_t addr, uint8_t val, void *priv)
         if (local->bank[addr_id] == 0xff)
             return;
 #endif
+#ifdef ENABLE_NVR_AT_LOG
+        {
+            static uint32_t traced = 0;
+
+            if ((local->addr[addr_id] >= 0x10) && (traced < 4096)) {
+                traced++;
+                pclog("NVR: [%04X:%08X] port %04X write index %02X (bank %u) = %02X (was %02X)\n",
+                      CS, cpu_state.pc, addr, local->addr[addr_id], local->bank[addr_id], val,
+                      nvr->regs[local->addr[addr_id]]);
+            }
+        }
+#endif
         nvr_reg_write(local->addr[addr_id], val, priv);
     } else {
         local->addr[addr_id] = (val & (nvr->size - 1));
@@ -930,6 +942,47 @@ nvr_read(uint16_t addr, void *priv)
             ret = (ret & 0x7f) | (nmi_mask ? 0x00 : 0x80);
     }
 
+#ifdef ENABLE_NVR_AT_LOG
+    if (addr & 1) {
+        static uint32_t traced = 0;
+
+        if ((((local->addr[addr_id] >= 0x60) && (local->addr[addr_id] <= 0x6f)) || (local->addr[addr_id] == 0x0e)) && (traced < 2048)) {
+            traced++;
+            pclog("NVR: [%04X:%08X] port %04X read index %02X = %02X\n", CS, cpu_state.pc, addr,
+                  local->addr[addr_id], ret);
+            {
+                uint32_t sp = cpu_state.seg_ss.base + (cpu_state.regs[4].w);
+
+                if ((cpu_state.regs[3].w == 0x4064) && (mem_readw_phys(sp + 8) == 0x141c)) {
+                    extern int cpu_trace_arm;
+                    cpu_trace_arm = 1;
+                    uint32_t code = ((uint32_t) mem_readw_phys(sp + 10) << 4) + 0x140d;
+                    char     hex[128];
+
+                    for (int i = 0; i < 28; i++)
+                        sprintf(hex + i * 3, "%02X ", mem_readb_phys(code + i));
+                    pclog("NVR:   DIM code at %04X:140D = %s\n", mem_readw_phys(sp + 10), hex);
+                    for (int i = 0; i < 8; i++)
+                        sprintf(hex + i * 3, "%02X ", mem_readb_phys(0xfeed5 + i));
+                    pclog("NVR:   F000:EED5 = %s\n", hex);
+                    for (int i = 0; i < 8; i++)
+                        sprintf(hex + i * 3, "%02X ", mem_readb_phys(0xfef1e + i));
+                    pclog("NVR:   F000:EF1E = %s\n", hex);
+                    for (int i = 0; i < 24; i++)
+                        sprintf(hex + i * 3, "%02X ", mem_readb_phys(0xf8506 + i));
+                    pclog("NVR:   F000:8506 = %s\n", hex);
+                    for (int i = 0; i < 12; i++)
+                        sprintf(hex + i * 3, "%02X ", mem_readb_phys(0xf84bc + i));
+                    pclog("NVR:   F000:84BC = %s\n", hex);
+                }
+                pclog("NVR:   bx=%04X cx=%04X stack %04X %04X %04X %04X %04X %04X %04X\n",
+                      cpu_state.regs[3].w, cpu_state.regs[1].w,
+                      mem_readw_phys(sp), mem_readw_phys(sp + 2), mem_readw_phys(sp + 4), mem_readw_phys(sp + 6),
+                      mem_readw_phys(sp + 8), mem_readw_phys(sp + 10), mem_readw_phys(sp + 12));
+            }
+        }
+    }
+#endif
     return ret;
 }
 

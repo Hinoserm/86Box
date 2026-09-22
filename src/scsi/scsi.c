@@ -78,7 +78,7 @@ static SCSI_CARD scsi_cards[] = {
     { &aha1740a_device,          },
     { &aha1742a_device,          },
     { &aha1744_device,           },
-    { &aha2740_device,           },
+    { &aha2742_device,           },
     /* MCA */
     { &aha1640_device,           },
     { &buslogic_640a_device,     },

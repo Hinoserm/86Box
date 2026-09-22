@@ -207,6 +207,8 @@ fetch_ea_16_long(uint32_t rmdat)
     return 1
 
 #include "x86_flags.h"
+int cpu_trace_window = 0;
+int cpu_trace_arm = 0;
 
 #define PREFETCH_RUN(instr_cycles, bytes, modrm, reads, reads_l, writes, writes_l, ea32)      \
     do {                                                                                      \
@@ -404,6 +406,11 @@ exec386_dynarec_int(void)
             cpu_state.temp_cs = cs;
             cpu_state.temp_pc = cpu_state.pc;
 
+            if (cpu_trace_window > 0) {
+                cpu_trace_window--;
+                pclog("EXEC %04X:%04X op=%02X ax=%04X bx=%04X cx=%04X dx=%04X ZF=%d CF=%d sp=%04X\n", CS, cpu_state.pc,
+                      fetchdat & 0xff, AX, BX, CX, DX, !!ZF_SET(), !!CF_SET(), cpu_state.regs[4].w);
+            }
             opcode = fetchdat & 0xFF;
             fetchdat >>= 8;
 
@@ -1310,6 +1317,11 @@ exec386(int32_t cycs)
                 if (in_smm)
                     x386_dynarec_log("[%04X:%08X] %08X\n", CS, cpu_state.pc, fetchdat);
 #endif
+                if (cpu_trace_window > 0) {
+                    cpu_trace_window--;
+                    pclog("EXEC %04X:%04X op=%02X ax=%04X bx=%04X cx=%04X dx=%04X ZF=%d CF=%d sp=%04X\n", CS, cpu_state.pc,
+                          fetchdat & 0xff, AX, BX, CX, DX, !!ZF_SET(), !!CF_SET(), cpu_state.regs[4].w);
+                }
                 opcode = fetchdat & 0xFF;
                 fetchdat >>= 8;
 #ifdef USE_DEBUG_REGS_486

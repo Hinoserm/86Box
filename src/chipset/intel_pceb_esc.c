@@ -1300,6 +1300,24 @@ esc_read(uint16_t port, void *priv)
             esc_log("ESC: [%04X:%08X] cram rd %02x:%02x = %02x\n", CS,
                     cpu_state.pc, esc_cram_page(dev), port & 0xff,
                     dev->cram[(esc_cram_page(dev) * 256) + (port & 0xff)]);
+#ifdef ENABLE_ESC_LOG
+            {
+                /* Every 512th read, the return addresses on the guest stack:
+                   the primitive at F000:69D7 has pushed flags, BX and DX by
+                   the time it reads, so its caller is at SS:SP+6 and the
+                   caller's caller a little above that. */
+                static uint32_t n = 0;
+
+                if ((n++ % 512) == 0) {
+                    uint32_t sp = cpu_state.seg_ss.base + SP;
+
+                    esc_log("ESC:   stack %04X %04X %04X %04X %04X %04X %04X %04X\n",
+                            mem_readw_phys(sp + 6), mem_readw_phys(sp + 8), mem_readw_phys(sp + 10),
+                            mem_readw_phys(sp + 12), mem_readw_phys(sp + 14), mem_readw_phys(sp + 16),
+                            mem_readw_phys(sp + 18), mem_readw_phys(sp + 20));
+                }
+            }
+#endif
             return dev->cram[(esc_cram_page(dev) * 256) + (port & 0xff)];
 
         case 0x0464:
