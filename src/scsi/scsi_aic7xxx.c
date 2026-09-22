@@ -68,6 +68,7 @@
 #include <wchar.h>
 #define HAVE_STDARG_H
 #include <86box/86box.h>
+#include "cpu.h"
 #include <86box/io.h>
 #include <86box/mem.h>
 #include <86box/rom.h>
@@ -4779,6 +4780,21 @@ aic_pci_read(int func, int addr, UNUSED(int len), void *priv)
 {
     const aic7xxx_t *dev = (const aic7xxx_t *) priv;
 
+#ifdef ENABLE_PIIX_CFG_TRACE
+    {
+        static uint32_t traced = 0;
+
+        if (((addr & 0xff) < 0x10) && (traced < 400)) {
+            extern int cpu_trace_arm, cpu_trace_window;
+            traced++;
+            if (cpu_trace_arm && (func == 0) && ((addr & 0xff) == 0)) {
+                cpu_trace_arm = 0;
+                cpu_trace_window = 400;
+            }
+            pclog("%s: [%04X:%08X] pci conf rd f%d %02X\n", ((const aic7xxx_t *) priv)->tag, CS, cpu_state.pc, func, addr & 0xff);
+        }
+    }
+#endif
     if (func > 0)
         return 0xff;
     if (AIC7880_LOG_REGS) {
@@ -4790,6 +4806,24 @@ aic_pci_read(int func, int addr, UNUSED(int len), void *priv)
 static void
 aic_pci_write(int func, int addr, UNUSED(int len), uint8_t val, void *priv)
 {
+#ifdef ENABLE_PIIX_CFG_TRACE
+    {
+        static uint32_t traced = 0;
+
+        if (traced < 512) {
+            traced++;
+            {
+                uint32_t sp = cpu_state.seg_ss.base + cpu_state.regs[4].w;
+
+                pclog("%s: [%04X:%08X] pci conf wr f%d %02X = %02X  stack %04X %04X %04X %04X %04X %04X %04X %04X %04X %04X\n",
+                      ((aic7xxx_t *) priv)->tag, CS, cpu_state.pc, func, addr & 0xff, val,
+                      mem_readw_phys(sp), mem_readw_phys(sp + 2), mem_readw_phys(sp + 4), mem_readw_phys(sp + 6),
+                      mem_readw_phys(sp + 8), mem_readw_phys(sp + 10), mem_readw_phys(sp + 12), mem_readw_phys(sp + 14),
+                      mem_readw_phys(sp + 16), mem_readw_phys(sp + 18));
+            }
+        }
+    }
+#endif
     aic7xxx_t *dev = (aic7xxx_t *) priv;
 
     if (func > 0)
@@ -5138,9 +5172,16 @@ aic_init(const device_t *info)
 
     aic_chip_reset(dev);
 
+    /* The on-board part takes the slot the machine reserves for it: on
+       the 54TDP that is device 8, and the BIOS knows the chip by that
+       number -- its "OnBoard SCSI" switch, CMOS 64h bit 6, is applied to
+       device 8 and nothing else, and its POST summary calls device 8
+       "Onboard". Registered as an ordinary card the chip landed in the
+       first free slot instead, device 10, where the BIOS saw an add-in
+       card in "PCI Slot 3" and configured it whatever the switch said. */
     if (!dev->eisa)
-        pci_add_card(PCI_ADD_NORMAL, aic_pci_read, aic_pci_write, dev,
-                     &dev->pci_slot);
+        pci_add_card((dev->board == BOARD_7880) ? PCI_ADD_SCSI : PCI_ADD_NORMAL,
+                     aic_pci_read, aic_pci_write, dev, &dev->pci_slot);
 
     if (dev->twin)
         aic_log(dev->tag, "board %i, %s, channel A on bus %i, channel B on "
