@@ -1792,18 +1792,46 @@ aic_tgt_acked(aic7xxx_t *dev)
    high one; ENSELO starts it. A target that is there answers; one that is
    not lets the timer expire into SELTO. */
 static void
-aic_select_start(aic7xxx_t *dev)
+aic_select_start_ch(aic7xxx_t *dev, uint8_t ch)
 {
     if (dev->selecting || (dev->bus_state != BUS_FREE))
         return;
     dev->selecting = 1;
     /* And it stays that channel's until it finishes, however many times
        the firmware flips SELBUSB while it is running. */
-    dev->sel_ch = dev->cell_live;
-    dev->sstat0 |= SELINGO;
+    dev->sel_ch = ch;
+    aic_ch_sstat0(dev, ch, SELINGO, 0);
     /* The timer is nominal: the firmware only cares that a present
        target is quick and an absent one is not. */
     timer_on_auto(&dev->sel_timer, 100.0);
+}
+
+/* ENSELO written to the cell the file is looking at. */
+static void
+aic_select_start(aic7xxx_t *dev)
+{
+    aic_select_start_ch(dev, dev->cell_live);
+}
+
+/* A selection that could not have the bus is still wanted, on whichever
+   cell asked for it. ENSELO written while a target holds the bus is not
+   thrown away: the chip waits for bus free, arbitrates, and selects then.
+   It is that cell's SCSIID that goes out, which is why this looks at both
+   and does not assume the one that happens to be switched in. */
+static void
+aic_select_pending(aic7xxx_t *dev)
+{
+    if (dev->selecting || (dev->bus_state != BUS_FREE))
+        return;
+    for (uint8_t ch = 0; ch < 2; ch++) {
+        uint8_t seq = aic_ch_scsiseq(dev, ch);
+        uint8_t st0 = (ch == dev->cell_live) ? dev->sstat0 : dev->cell_save[ch].sstat0;
+
+        if ((seq & ENSELO) && !(st0 & SELDO)) {
+            aic_select_start_ch(dev, ch);
+            return;
+        }
+    }
 }
 
 static void
@@ -1877,7 +1905,11 @@ aic_select_done(void *priv)
     /* ATN is not driven through SCSISIGO for this: the chip raises it
        itself on a successful select-out when told to, which is how the
        firmware gets a message out phase for its identify message. */
-    if (dev->scsiseq & ENAUTOATNO)
+    /* From the channel the selection was started on, not the one the file
+       happens to be switched to when it finishes: the firmware goes back
+       to its poll loop, which flips SELBUSB every pass, while the
+       selection runs. */
+    if (aic_ch_scsiseq(dev, dev->sel_ch) & ENAUTOATNO)
         dev->atn = 1;
     aic_log(dev->tag, "select %i: ok (atn %i) scb%u ctl %02x tcl %02x cmdlen %02x\n", id,
             dev->atn, dev->scbptr & (dev->chip->scb_pages - 1),
@@ -1974,8 +2006,18 @@ aic_scsi_reset_bus(aic7xxx_t *dev)
     /* A reset clears SCSISIGO and everything in SCSISEQ but the bit that
        is causing it. */
     dev->scsisigo = 0;
+    /* "All bits except SCSIRSTO are cleared by SCSI Bus Reset" -- on
+       both cells, not only the one the file is looking at. Leaving the
+       other bank's ENSELO standing had the next bus-free restart a
+       selection from it with whatever SCSIID it last held. */
     dev->scsiseq &= SCSIRSTO;
     dev->sstat0 &= ~(SELDO | SELDI | SELINGO);
+    for (uint8_t ch = 0; ch < 2; ch++) {
+        if (ch != dev->cell_live) {
+            dev->cell_save[ch].scsiseq &= SCSIRSTO;
+            dev->cell_save[ch].sstat0 &= (uint8_t) ~(SELDO | SELDI | SELINGO);
+        }
+    }
     timer_stop(&dev->sel_timer);
     timer_stop(&dev->tgt_timer);
     timer_stop(&dev->req_timer);
@@ -2229,8 +2271,7 @@ aic_pump(aic7xxx_t *dev)
        thrown away: the chip waits for bus free, arbitrates, and selects
        then. Dropping it loses the command the firmware had just taken
        off its queue, and nothing ever asks for it again. */
-    if ((dev->scsiseq & ENSELO) && !dev->selecting && (dev->bus_state == BUS_FREE) && !(dev->sstat0 & SELDO))
-        aic_select_start(dev);
+    aic_select_pending(dev);
 
     aic_bitbucket(dev);
     aic_dma_scsi(dev);
@@ -3910,8 +3951,7 @@ aic_seq_timer(void *priv)
     dev->host_wait = 0;
     aic_tgt_req_due(dev);
 
-    if ((dev->scsiseq & ENSELO) && !dev->selecting && (dev->bus_state == BUS_FREE) && !(dev->sstat0 & SELDO))
-        aic_select_start(dev);
+    aic_select_pending(dev);
 
     aic_bitbucket(dev);
     aic_dma_host(dev);
