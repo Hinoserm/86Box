@@ -133,6 +133,18 @@ typedef struct pceb_t {
 
 /* The timer is clocked from BCLK divided by eight -- 8.33 MHz over eight
    is 1.04 MHz, so a count is a shade under a microsecond. */
+/* Eight BCLKs a tick, and BCLK is 8.33 MHz whatever the board runs at:
+   CLKDIV's divisor is picked to keep it there, "000 -> 4 (33.33 MHz) ->
+   8.33 MHz, 001 -> 3 (25 MHz) -> 8.33 MHz". So there is nothing for that
+   register to change here, and the tick is a shade under a microsecond.
+
+   The PCEB's own book says 1.03 MHz for this clock and "derived from the
+   8.25 MHz/8.33 MHz BCLK", which is the same number worked from a PCI
+   clock of 33.0 rather than the 33.33 its sibling tabulates -- 8.25 over
+   eight against 8.33 over eight, a percent apart. The ESC's table is the
+   one that says what BCLK actually is, so it is the one followed. Left
+   alone: the timer is documented to ±1 ms and this is a rounding in the
+   fourth digit. */
 #define PCEB_BIOS_TICK_US (8.0 / 8.33)
 
 static esc_t *esc_inst = NULL;
