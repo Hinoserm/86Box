@@ -3261,8 +3261,18 @@ aic_write(aic7xxx_t *dev, uint8_t addr, uint8_t val, int seq)
                    move could not be probed that way. */
                 if (!dev->wide)
                     forced |= SELWIDE;
-                if (val & SELWIDE)
+                /* On a wide board SELWIDE is the straps' -- "BCD-=GND and
+                   BBSY-=VDD indicates a wide connection and will clear
+                   SELBUSB and set SELWIDE" -- and with it set "this bit
+                   [SELBUSB] will be cleared". Channel B's data lines are
+                   the top half of channel A there; there is no channel
+                   to switch to. The option ROM's differential probe
+                   writes a bare 08h and then reads SCSISIGI, and it is
+                   channel A it must be reading. */
+                if (dev->wide || (val & SELWIDE))
                     forced |= SELBUSB;
+                if (dev->wide && (dev->chip->sblkctl_mask & SELBUSB))
+                    val |= SELWIDE;
 
                 dev->sblkctl = val & dev->chip->sblkctl_mask & ~forced;
                 aic_cell_swap(dev, (dev->sblkctl & SELBUSB) ? 1 : 0);
