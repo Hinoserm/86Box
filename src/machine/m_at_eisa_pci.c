@@ -110,16 +110,22 @@ machine_at_54tdp_init(const machine_t *model)
     /* The bridge sits where a south bridge would, because on this board
        it is one. */
     pci_register_slot(0x07, PCI_CARD_SOUTHBRIDGE, 0, 0, 0, 0);
-    /* The on-board SCSI, then the four slots. */
+    /* Where the real board puts things, read off the ECU's records of it:
+       the ESCD function structure it writes for each PCI device carries
+       the device/function byte ahead of the IDs, and on Hino's board that
+       is 80h for 9004:8078 -- device 16 -- and 70h for the Cirrus card in
+       a slot, device 14. The AMI BIOS knows the on-board SCSI by that
+       device number: at device 8 it listed the chip as "PCI Slot 3 SCSI",
+       ran its BIOS module as an add-in card's, and left its OnBoard SCSI
+       setup switch with nothing to act on. */
     /* The BIOS only ever routes PIRQC and PIRQD, to IRQ 10 and 11. The
        on-board SCSI is the one that has to land on a real interrupt, and
        the board puts it on 10, so its INTA goes to PIRQC. */
-    pci_register_slot(0x08, PCI_CARD_SCSI, 3, 4, 1, 2);
-    pci_register_slot(0x09, PCI_CARD_VIDEO, 4, 1, 2, 3);
-    pci_register_slot(0x0a, PCI_CARD_NORMAL, 3, 4, 1, 2);
-    pci_register_slot(0x0b, PCI_CARD_NORMAL, 4, 1, 2, 3);
     pci_register_slot(0x0c, PCI_CARD_NORMAL, 1, 2, 3, 4);
     pci_register_slot(0x0d, PCI_CARD_NORMAL, 2, 3, 4, 1);
+    pci_register_slot(0x0e, PCI_CARD_VIDEO, 4, 1, 2, 3);
+    pci_register_slot(0x0f, PCI_CARD_NORMAL, 3, 4, 1, 2);
+    pci_register_slot(0x10, PCI_CARD_SCSI, 3, 4, 1, 2);
 
     /* Four EISA slots. */
     eisa_init(4);
