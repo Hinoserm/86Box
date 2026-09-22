@@ -527,17 +527,6 @@ piix_write(int func, int addr, UNUSED(int len), uint8_t val, void *priv)
     if ((func == 1) || (addr == 0xf8) || (addr == 0xf9)) {
         piix_log("[W] %02X:%02X = %02X\n", func, addr, val);
     }
-#ifdef ENABLE_PIIX_CFG_TRACE
-    {
-        static uint32_t traced = 0;
-
-        if (traced < 4096) {
-            traced++;
-            pclog("PIIX: [%04X:%08X] conf wr %02X:%02X = %02X (was %02X)\n", CS, cpu_state.pc, func, addr,
-                  val, dev->regs[func & 3][addr]);
-        }
-    }
-#endif
 
     /* Return on unsupported function. */
     if (dev->max_func > 0) {

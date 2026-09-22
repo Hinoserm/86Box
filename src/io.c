@@ -438,17 +438,6 @@ outb(uint16_t port, uint8_t val)
             }
             p = q;
         }
-#ifdef ENABLE_IO_UNMAPPED_TRACE
-    {
-        static uint8_t seen[65536];
-
-        if (((!found) && (seen[port] < 8)) || (port == 0x0c00) || (port == 0xc000)) {
-            if (seen[port] < 255)
-                seen[port]++;
-            pclog("IO: [%04X:%08X] out %04X = %02X%s\n", CS, cpu_state.pc, port, val, found ? "" : " (no handler)");
-        }
-    }
-#endif
     }
 
     if (!found || (port == 0x84)) {

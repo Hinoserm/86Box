@@ -68,7 +68,6 @@
 #include <wchar.h>
 #define HAVE_STDARG_H
 #include <86box/86box.h>
-#include "cpu.h"
 #include <86box/io.h>
 #include <86box/mem.h>
 #include <86box/rom.h>
@@ -4779,21 +4778,6 @@ aic_pci_read(int func, int addr, UNUSED(int len), void *priv)
 {
     const aic7xxx_t *dev = (const aic7xxx_t *) priv;
 
-#ifdef ENABLE_PIIX_CFG_TRACE
-    {
-        static uint32_t traced = 0;
-
-        if (((addr & 0xff) < 0x10) && (traced < 400)) {
-            extern int cpu_trace_arm, cpu_trace_window;
-            traced++;
-            if (cpu_trace_arm && (func == 0) && ((addr & 0xff) == 0)) {
-                cpu_trace_arm = 0;
-                cpu_trace_window = 400;
-            }
-            pclog("%s: [%04X:%08X] pci conf rd f%d %02X\n", ((const aic7xxx_t *) priv)->tag, CS, cpu_state.pc, func, addr & 0xff);
-        }
-    }
-#endif
     if (func > 0)
         return 0xff;
     if (AIC7880_LOG_REGS) {
@@ -4805,24 +4789,6 @@ aic_pci_read(int func, int addr, UNUSED(int len), void *priv)
 static void
 aic_pci_write(int func, int addr, UNUSED(int len), uint8_t val, void *priv)
 {
-#ifdef ENABLE_PIIX_CFG_TRACE
-    {
-        static uint32_t traced = 0;
-
-        if (traced < 512) {
-            traced++;
-            {
-                uint32_t sp = cpu_state.seg_ss.base + cpu_state.regs[4].w;
-
-                pclog("%s: [%04X:%08X] pci conf wr f%d %02X = %02X  stack %04X %04X %04X %04X %04X %04X %04X %04X %04X %04X\n",
-                      ((aic7xxx_t *) priv)->tag, CS, cpu_state.pc, func, addr & 0xff, val,
-                      mem_readw_phys(sp), mem_readw_phys(sp + 2), mem_readw_phys(sp + 4), mem_readw_phys(sp + 6),
-                      mem_readw_phys(sp + 8), mem_readw_phys(sp + 10), mem_readw_phys(sp + 12), mem_readw_phys(sp + 14),
-                      mem_readw_phys(sp + 16), mem_readw_phys(sp + 18));
-            }
-        }
-    }
-#endif
     aic7xxx_t *dev = (aic7xxx_t *) priv;
 
     if (func > 0)
