@@ -5379,6 +5379,15 @@ static const device_config_t aic_card_config[] = {
                 .files         = { AHA2940UW_V121_ROM, "" }
             },
             {
+                .name          = "Version 1.23",
+                .internal_name = "v1_23",
+                .bios_type     = BIOS_NORMAL,
+                .files_no      = 1,
+                .local         = 0,
+                .size          = 65536,
+                .files         = { AHA2940UW_V123_ROM, "" }
+            },
+            {
                 .name          = "Version 1.25.0",
                 .internal_name = "v1_25_0",
                 .bios_type     = BIOS_NORMAL,
@@ -5404,15 +5413,6 @@ static const device_config_t aic_card_config[] = {
                 .local         = 0,
                 .size          = 65536,
                 .files         = { AHA2940UW_V220_ROM, "" }
-            },
-            {
-                .name          = "Version 1.23",
-                .internal_name = "v1_23",
-                .bios_type     = BIOS_NORMAL,
-                .files_no      = 1,
-                .local         = 0,
-                .size          = 65536,
-                .files         = { AHA2940UW_V123_ROM, "" }
             },
             { .files_no = 0 }
         },
