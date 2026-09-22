@@ -583,6 +583,7 @@ typedef struct aic7xxx_t {
     uint32_t      rom_writes;
     uint32_t      busl_reads;
     uint32_t      sig_logs; /* host SCSISIGI reads and SBLKCTL writes traced */
+    uint32_t      err_logs; /* hard errors traced */
     uint32_t      rom_size;
     uint8_t       bus;
     uint8_t       wide;
@@ -675,6 +676,7 @@ typedef struct aic7xxx_t {
     uint8_t  dscommand1;
     uint8_t  dspcistatus;
     uint8_t  hcntrl;
+    uint8_t  int_paused; /* PAUSE in HCNTRL was set by an interrupt, which PAUSEDIS cannot refuse */
     uint32_t haddr;
     uint32_t hcnt;
     uint8_t  scbptr;
@@ -814,20 +816,18 @@ aic_now_us(void)
 static int
 aic_paused(const aic7xxx_t *dev)
 {
-    /* A command-complete interrupt does not stop the sequencer; the other
-       three do, and PAUSEDIS is not theirs to overrule: "If set, disables
-       the pause function when PAUSE (bit 2, HCNTRL) is set. Pause due to
-       interrupts or error conditions is still enabled." */
-    if (dev->intstat & (BRKADRINT | SCSIINT | SEQINT))
+    /* PAUSE in HCNTRL is the one thing that stops the sequencer, whether
+       the host set it or an interrupt did -- see aic_int_pause. The
+       difference between the two is PAUSEDIS: "If set, disables the pause
+       function when PAUSE (bit 2, HCNTRL) is set. Pause due to interrupts
+       or error conditions is still enabled." So a pause the host merely
+       asked for can be refused while the sequencer is inside a critical
+       section, and one an interrupt imposed cannot. */
+    if (!(dev->hcntrl & PAUSE))
+        return 0;
+    if (dev->int_paused)
         return 1;
-    /* Those same three set PAUSE in HCNTRL as they go -- see aic_raise --
-       so this clause is also what holds the sequencer after the interrupt
-       has been cleared and before the driver has released it. A pause the
-       host merely asked for is PAUSEDIS's to refuse while the sequencer
-       is inside a critical section. */
-    if ((dev->hcntrl & PAUSE) && !(dev->seqctl & PAUSEDIS))
-        return 1;
-    return 0;
+    return !(dev->seqctl & PAUSEDIS);
 }
 
 static void
@@ -916,30 +916,55 @@ aic_update_irq(aic7xxx_t *dev)
    interrupt table says so in as many words. Both the sequencer's own
    write to INTSTAT and the model raising one on its behalf come through
    here. */
-static void
-aic_int_pause(aic7xxx_t *dev)
-{
-    /* NOT DONE HERE, and the reason is measured rather than argued.
-       Latching it deadlocks the AHA-2740's option ROM outright. Its
-       sequencer raises SEQINT with reason code 8, its host side does not
-       recognise that code and never writes CLRINT, and it sits pausing
-       and unpausing for ever -- forty five million times in one run. With
-       the pause taken from INTSTAT alone the same firmware keeps running,
-       reaches its own timeout and carries on, which is worse behaviour
-       than it should have but is progress rather than a stop.
+/* An interrupt stops the sequencer by setting the host's own PAUSE bit.
+   HCNTRL bit 2 "is also set by certain hardware conditions listed below",
+   and the list is BRKADRINT, SCSIINT and SEQINT; the interrupt summary
+   table has Pause = Yes for every one of them and No for command
+   complete alone. Which matters for how long the stop lasts: "Clearing
+   this bit will release the Sequencer" is the only thing that does, so
+   the sequencer stays held after the interrupt itself has been cleared,
+   until the driver writes HCNTRL to let it go -- "The Sequencer may be
+   restarted by clearing the SEQINT bit and writing a zero to the PAUSE
+   bit in HCNTRL."
 
-       So the latch waits on the code 8 it is entangled with. What it does
-       fix is real -- ninety illegal host accesses a POST, and the card
-       installing when a drive answers -- but not at the price of a box
-       that will not finish POST. See the notes in ~/src/86aic/eisa. */
-    (void) dev;
+   Taking the stop from INTSTAT alone let it start again the moment CLRINT
+   was written, and that is the middle of what every driver does: service
+   the interrupt, clear it, read and write the registers it came for, and
+   only then unpause. Those accesses landed on a running sequencer and
+   were answered with ILLHADDR, which is BRKADRINT, which the driver
+   cleared and went on reading -- Windows 98's driver and this model spun
+   on that pair a million times a second and the log ate the emulator.
+
+   It is the event that pauses, not the standing bit. A sequencer
+   interrupt is the instruction that raises it, and it pauses every time
+   even when the host has not cleared the last one; a SCSI interrupt is a
+   condition, and pauses when it appears. A host that releases PAUSE with
+   the interrupt still standing gets its one instruction and a running
+   sequencer, as the book says: "When PAUSE is cleared, the Sequencer will
+   always execute at least one instruction, even if some other event is
+   active to pause the Sequencer." An earlier attempt held the sequencer
+   for as long as INTSTAT had the bit, and an option ROM that never
+   cleared one stopped for good. */
+static void
+aic_int_pause(aic7xxx_t *dev, uint8_t bits, uint8_t before)
+{
+    uint8_t pause = bits & (SEQINT | BRKADRINT);
+
+    if ((bits & SCSIINT) && !(before & SCSIINT))
+        pause |= SCSIINT;
+    if (pause) {
+        dev->hcntrl |= PAUSE;
+        dev->int_paused = 1;
+    }
 }
 
 static void
 aic_raise(aic7xxx_t *dev, uint8_t bits)
 {
+    uint8_t before = dev->intstat;
+
     dev->intstat |= bits;
-    aic_int_pause(dev);
+    aic_int_pause(dev, bits, before);
     aic_update_irq(dev);
 }
 
@@ -999,10 +1024,19 @@ aic_hard_error(aic7xxx_t *dev, uint8_t bits, uint8_t addr, int write)
        appearing here is this model's news rather than the firmware's --
        and the only way to tell which of this model's rules is wrong is
        to say which register tripped it. */
-    aic_log(dev->tag, "hard error %02x (error %02x) at pc %03x, dfcntrl %02x, "
-            "%s %02x, seqctl %02x hcntrl %02x\n", bits, dev->error | bits,
-            dev->pc, dev->dfcntrl, write ? "host wrote" : "host read", addr,
-            dev->seqctl, dev->hcntrl);
+    /* Bounded, like HCNTRL: a driver and this model disagreeing about
+       whether the sequencer is stopped produce one of these per access,
+       and a driver's interrupt handler makes a million accesses a second.
+       An unbounded trace of that wrote 1.6 GB in five minutes and slowed
+       the emulator to a quarter speed. */
+    if ((dev->err_logs < 256) || ((dev->err_logs % 100000) == 0)) {
+        aic_log(dev->tag, "hard error %02x (error %02x) at pc %03x, dfcntrl %02x, "
+                "%s %02x, seqctl %02x hcntrl %02x%s\n", bits, dev->error | bits,
+                dev->pc, dev->dfcntrl, write ? "host wrote" : "host read", addr,
+                dev->seqctl, dev->hcntrl,
+                (dev->err_logs >= 256) ? " [1 in 100000]" : "");
+    }
+    dev->err_logs++;
     dev->error |= bits;
     if (dev->chip->faildis_honoured) {
         dev->seqctl &= ~PAUSEDIS;
@@ -3320,6 +3354,10 @@ aic_write(aic7xxx_t *dev, uint8_t addr, uint8_t val, int seq)
                 dev->hcntrl_logs++;
             was         = dev->hcntrl;
             dev->hcntrl = val & ~CHIPRST;
+            /* "Clearing this bit will release the Sequencer", and that
+               includes the copy of it an interrupt set. */
+            if (!(val & PAUSE))
+                dev->int_paused = 0;
             if (val & CHIPRST) {
                 /* A chip reset from the host. The same bit reads back as
                    CHIPRESETACK to say it happened, on this part as much as
@@ -3407,11 +3445,12 @@ aic_write(aic7xxx_t *dev, uint8_t addr, uint8_t val, int seq)
                not collected yet must survive the sequencer interrupt that
                comes after it. The high four are the sequencer's reason
                code, and go with SEQINT. */
+            was = dev->intstat;
             if (val & SEQINT)
                 dev->intstat = (dev->intstat & INT_PEND) | val;
             else
                 dev->intstat |= val & INT_PEND;
-            aic_int_pause(dev);
+            aic_int_pause(dev, val & INT_PEND, was);
             aic_update_irq(dev);
             break;
         case ERROR: /* CLRINT */
@@ -4083,7 +4122,8 @@ static void
 aic_chip_reset(aic7xxx_t *dev)
 {
     aic_log(dev->tag, "chip reset\n");
-    dev->busl_reads = dev->rom_writes = dev->hcntrl_logs = dev->sig_logs = 0;
+    dev->busl_reads = dev->rom_writes = dev->hcntrl_logs = dev->sig_logs = dev->err_logs = 0;
+    dev->int_paused = 0;
 
     timer_stop(&dev->seq_timer);
     timer_stop(&dev->sel_timer);
