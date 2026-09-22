@@ -392,9 +392,12 @@ tc59x_eeprom_build(tc59x_t *dev)
 
     memset(e, 0, sizeof(dev->eeprom));
 
-    e[0x00] = (uint16_t) ((dev->mac[1] << 8) | dev->mac[0]);
-    e[0x01] = (uint16_t) ((dev->mac[3] << 8) | dev->mac[2]);
-    e[0x02] = (uint16_t) ((dev->mac[5] << 8) | dev->mac[4]);
+    /* The node address is packed a byte pair to a word, first byte high:
+       the book's default of 0020h, AFxxh, xxxxh is 00:20:AF:xx:xx:xx, and
+       a driver takes each word as big endian. */
+    e[0x00] = (uint16_t) ((dev->mac[0] << 8) | dev->mac[1]);
+    e[0x01] = (uint16_t) ((dev->mac[2] << 8) | dev->mac[3]);
+    e[0x02] = (uint16_t) ((dev->mac[4] << 8) | dev->mac[5]);
     /* ProductId, byte swapped in the EEPROM so that the register reads as
        the two EISA identifier bytes in slot order: 59h 70h for TCM5970. */
     e[0x03] = (uint16_t) ((dev->id[3] << 8) | dev->id[2]);
@@ -659,7 +662,12 @@ tc59x_rx_accept(const tc59x_t *dev, const uint8_t *dst)
     return 0;
 }
 
-/* A frame off the network, or one of the card's own looped back. */
+/* A frame off the network, or one of the card's own looped back. The
+   return value is the queue's: one for a frame taken, whether it was kept
+   or thrown away, and zero only for one the card could not take yet,
+   which is held at the head of the queue and offered again. Answering
+   zero for a frame the filter rejects would park it there for ever, in
+   front of everything that follows. */
 static int
 tc59x_rx(void *priv, uint8_t *buf, int io_len)
 {
@@ -668,12 +676,10 @@ tc59x_rx(void *priv, uint8_t *buf, int io_len)
     uint16_t          len = (uint16_t) io_len;
     uint32_t          crc;
 
-    if (!dev->rx_enabled || (io_len <= 0))
-        return 0;
-    if (io_len < 14)
-        return 0;
+    if (!dev->rx_enabled || (io_len < 14))
+        return 1;
     if (!tc59x_rx_accept(dev, buf))
-        return 0;
+        return 1;
 
     if (len > NET_MAX_FRAME)
         len = NET_MAX_FRAME;
