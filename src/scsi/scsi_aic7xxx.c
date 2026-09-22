@@ -1192,10 +1192,12 @@ aic_strap_pins(const aic7xxx_t *dev, uint8_t ch)
     /* DualBusses: nothing tied, the register reads channel B's bus. */
     if (dev->twin)
         return 0;
-    /* Wide: BCD- grounded -- but SELWIDE clears SELBUSB, so channel B's
-       file is never in front and this is not reached. */
+    /* Wide: BCD- grounded. A differential board grounds BMSG- as well:
+       the option ROM takes C/D with MSG as differential (x86 1F63h), and
+       the Windows 98 driver's probe reads C/D for wide and then MSG for
+       wide differential, which is the AHA-2744W and no other. */
     if (dev->wide)
-        return CDI;
+        return (uint8_t) (CDI | (dev->diff ? MSGI : 0));
     /* One narrow connector: BMSG- grounded, BBSY- and BCD- at VDD. */
     return MSGI;
 }
@@ -2524,16 +2526,10 @@ aic_read(aic7xxx_t *dev, uint8_t addr, int seq)
                else driven: the ROM sets SELBUSB, reads here, and takes
                MSG without BSY as no second channel (x86 1E07h) and C/D
                with MSG as a differential board (1F63h). A wide board
-               grounds BCD-, but SELWIDE clears SELBUSB, so its channel B
-               pins are never in front of the file. */
+               grounds BCD-, and software that wants to see it clears
+               SELWIDE and sets SELBUSB first, as both the ROM and the
+               Windows 98 driver do. */
             ret = aic_strap_pins(dev, dev->cell_live);
-            /* A differential board's transceivers sit between the pins
-               and the bus, and with the bus free the option ROM reads
-               C/D and MSG asserted through them -- that is its test for
-               a differential board (x86 1F63h), made on channel A after
-               a SELBUSB write that SELWIDE has cleared. */
-            if ((ret == 0) && dev->diff && (dev->cell_live == 0) && (dev->bus_state != BUS_BUSY) && !dev->selecting)
-                ret = CDI | MSGI;
             if (ret == 0) {
                 if (dev->bus_state == BUS_BUSY) {
                     ret |= BSYI | dev->tgt_phase;
@@ -3204,75 +3200,34 @@ aic_write(aic7xxx_t *dev, uint8_t addr, uint8_t val, int seq)
         case SBLKCTL:
             /* On the AIC-7770 this register is SELBUSB and SELWIDE and
                nothing else; the data book has bits 7-4, 2 and 0 always
-               reading zero. Which of the two the part will take is
-               strapped on its pins, and a board wired for channel A alone
-               "will force SELBUSB and SELWIDE to be cleared". The later
-               parts put their diagnostic LED and FIFO bits in the same
-               register, so they keep the wider mask. */
-            /* What the straps will not let the bit do. An earlier note
-               here had this the other way round -- it said the straps
-               only decide what the register comes up holding and do not
-               make it read only, and that refusing the write would hang
-               a single channel board. Both halves were wrong, and the
-               note is what kept the AHA-2740 broken.
+               reading zero. The later parts put their diagnostic LED and
+               FIFO bits in the same register, so they keep the wider
+               mask.
 
-               The book forces it: "BMSG-=GND and BBSY-=VDD indicates
-               that Channel B is not being used and will force SELBUSB
-               and SELWIDE to be cleared", with the reset table giving
-               00h for Channel A only, 08h for DualBusses and 02h for
-               Wide. Forced, not merely initialised -- the pins are tied,
-               so there is no channel there to switch to.
+               It is the whole register block that switches, not a mode:
+               "Device addresses 00h-1Eh reflect the Channel B registers.
+               When this bit is cleared, addresses 00h-1Eh reflect Channel
+               A registers", both channels "mapped to the same I/O space".
 
-               And it is the whole register block that switches, not a
-               mode: "Device addresses 00h-1Eh reflect the Channel B
-               registers. When this bit is cleared, addresses 00h-1Eh
-               reflect Channel A registers", with both channels "mapped
-               to the same I/O space". This model has one copy of that
-               block, which is correct for a board with one channel and
-               is why a twin one still needs work.
-
-               Far from hanging the card, this is what makes it run. Its
-               firmware flips the bit on every pass of its poll loop --
-               "xor SBLKCTL, SELBUSB" sits between the SELTO test and the
-               SELDO test -- and then, having seen a selection or a
-               reselection, walks its SCBs for one whose channel bit
-               agrees with SBLKCTL, reporting INTCODE 8 and stopping if
-               none does. On real silicon the flip is harmless twice
-               over: on a one channel board the bit cannot move, and on a
-               twin one the status it tests belongs to whichever channel
-               it is looking at. Letting the bit move here while only one
-               cell exists meant the comparison failed whenever the flip
-               landed on B -- which is half the time.
-
-               SELWIDE forces it too: "If SELWIDE (bit 1) is set, this
-               bit will be cleared", the wide connection being channel
-               B's data lines lent to channel A. */
+               What the straps decide is the reset value and nothing more:
+               "SELBUSB and SELWIDE may be initialized on Chip Reset to
+               indicate the hardware connection to the chip", with the
+               table giving 00h for one narrow connector, 08h for two and
+               02h for a wide one. The one live rule is the book's own:
+               "If SELWIDE (bit 1) is set, this bit [SELBUSB] will be
+               cleared", the wide connection being channel B's data lines
+               lent to channel A. Everything that reads the board's
+               wiring relies on the bits moving: the AHA-2740's ROM sets
+               SELBUSB and reads SCSISIGI to count its channels (x86
+               1DF5h-1E19h), and Windows 98's ARROW.MPD clears SELWIDE,
+               sets SELBUSB, and reads the same register to tell narrow
+               from wide from wide differential (its routine at 14F6Ch).
+               An earlier pass here pinned SELWIDE on a wide board and
+               refused SELBUSB; that probe then read channel A's idle bus,
+               took the 2742W for a twin channel card, and the driver
+               failed to start. */
             {
-                uint8_t forced = 0;
-
-                /* Not forced by a missing connector. The strap note --
-                   "BMSG-=GND and BBSY-=VDD indicates that Channel B is
-                   not being used and will force SELBUSB and SELWIDE to
-                   be cleared" -- is about what the register comes up
-                   holding ("may be initialized on Chip Reset"), and the
-                   AHA-2740's own option ROM settles it: to count its
-                   channels it sets SELBUSB, reads SCSISIGI, and only
-                   then decides (x86 1DF5h-1E19h). A bit that would not
-                   move could not be probed that way. */
-                if (!dev->wide)
-                    forced |= SELWIDE;
-                /* On a wide board SELWIDE is the straps' -- "BCD-=GND and
-                   BBSY-=VDD indicates a wide connection and will clear
-                   SELBUSB and set SELWIDE" -- and with it set "this bit
-                   [SELBUSB] will be cleared". Channel B's data lines are
-                   the top half of channel A there; there is no channel
-                   to switch to. The option ROM's differential probe
-                   writes a bare 08h and then reads SCSISIGI, and it is
-                   channel A it must be reading. */
-                if (dev->wide || (val & SELWIDE))
-                    forced |= SELBUSB;
-                if (dev->wide && (dev->chip->sblkctl_mask & SELBUSB))
-                    val |= SELWIDE;
+                uint8_t forced = (val & SELWIDE) ? SELBUSB : 0;
 
                 dev->sblkctl = val & dev->chip->sblkctl_mask & ~forced;
                 aic_cell_swap(dev, (dev->sblkctl & SELBUSB) ? 1 : 0);
@@ -5003,10 +4958,10 @@ aic_init(const device_t *info)
     /* NOT a second connector, after all -- and the data book had it
        right. The v2.11 option ROM decides the channel count at init by
        reading SBLKCTL back and testing SELBUSB (x86 at 3636h): on a board
-       strapped Channel A only the bit is forced clear, it reads 00h, and
-       the ROM takes its single channel path and never asks after channel
-       B. Letting the bit move made the same ROM read 08h and walk a
-       channel it had never configured, with no selection timer on it.
+       strapped Channel A only the register comes up 00h, and the ROM
+       takes its single channel path and never asks after channel B. A
+       dual-bus strap here made the same ROM read 08h and walk a channel
+       it had never configured, with no selection timer on it.
        The two cells are still modelled for a board that has both; what
        decides is the strap, and this card's is one connector. */
 
