@@ -582,6 +582,7 @@ typedef struct aic7xxx_t {
     uint32_t      rom_reads;
     uint32_t      rom_writes;
     uint32_t      busl_reads;
+    uint32_t      sig_logs; /* host SCSISIGI reads and SBLKCTL writes traced */
     uint32_t      rom_size;
     uint8_t       bus;
     uint8_t       wide;
@@ -1126,11 +1127,33 @@ aic_ch_sstat1(aic7xxx_t *dev, uint8_t ch, uint8_t set, uint8_t clr)
         dev->cell_save[ch].sstat1 = (uint8_t) ((dev->cell_save[ch].sstat1 & ~clr) | set);
 }
 
+/* The control pins the board ties, as SCSISIGI shows them for a channel.
+   Zero means the channel is wired to a bus and the register reads it. */
+static uint8_t
+aic_strap_pins(const aic7xxx_t *dev, uint8_t ch)
+{
+    if (ch == 0)
+        return 0;
+    if (dev->twin)
+        return 0;
+    /* One narrow connector: BMSG- grounded, BBSY- and BCD- at VDD. */
+    return MSGI;
+}
+
 /* What a channel's SCSISEQ says, wherever it is kept. */
 static uint8_t
 aic_ch_scsiseq(const aic7xxx_t *dev, uint8_t ch)
 {
     return (ch == dev->cell_live) ? dev->scsiseq : dev->cell_save[ch].scsiseq;
+}
+
+static void
+aic_ch_scsiseq_clr(aic7xxx_t *dev, uint8_t ch, uint8_t bits)
+{
+    if (ch == dev->cell_live)
+        dev->scsiseq &= (uint8_t) ~bits;
+    else
+        dev->cell_save[ch].scsiseq &= (uint8_t) ~bits;
 }
 
 static uint8_t
@@ -1284,7 +1307,17 @@ aic_find_reselect(aic7xxx_t *dev)
     double now = aic_now_us();
 
     for (uint8_t i = 0; i < AIC_CMDS; i++) {
-        if (dev->cmds[i].used && dev->cmds[i].waited && (now >= dev->cmds[i].ready_at))
+        const aic_cmd_t *c = &dev->cmds[i];
+
+        /* "ENRSELI: enables the device to respond to a reselection" is a
+           bit in the cell the target is wired to, and the cell answers
+           whether or not SELBUSB has its registers in front. The
+           firmware's idle loop flips SELBUSB every pass, so testing the
+           live copy refused a channel A target whenever the flip had
+           landed on B -- and nothing retried until the host's timeout
+           wrote SCSISEQ fifteen seconds later. */
+        if (c->used && c->waited && (now >= c->ready_at) &&
+            (aic_ch_scsiseq(dev, aic_ch_of_bus(dev, c->bus)) & ENRSELI))
             return &dev->cmds[i];
     }
     return NULL;
@@ -1903,7 +1936,7 @@ aic_select_done(void *priv)
 
     c = aic_cmd_alloc(dev);
     if (c == NULL) {
-        dev->scsiseq &= ~ENSELO;
+        aic_ch_scsiseq_clr(dev, dev->sel_ch, ENSELO);
         aic_ch_sstat1(dev, dev->sel_ch, SELTO, 0);
         aic_bus_changed(dev);
         return;
@@ -1946,8 +1979,6 @@ aic_reselect_try(aic7xxx_t *dev)
     uint8_t    msg;
 
     if ((dev->bus_state != BUS_FREE) || dev->selecting)
-        return;
-    if (!(dev->scsiseq & ENRSELI))
         return;
     c = aic_find_reselect(dev);
     if (c == NULL)
@@ -2396,27 +2427,45 @@ aic_read(aic7xxx_t *dev, uint8_t addr, int seq)
         case SXFRCTL1:
             return dev->sxfrctl1;
         case SCSISIG: /* SCSISIGI: what is actually on the wires */
-            ret = 0;
-            /* A channel the board does not bring out has its control
-               pins tied, and the register reads the pins: "BMSG-=GND and
-               BBSY-=VDD indicates that Channel B is not being used", so
-               switched to it the file shows MSG asserted and BSY negated
-               with nothing else driven. That is what the option ROM
-               looks for when it counts channels -- it sets SELBUSB,
-               reads here, and takes MSG without BSY as no channel. */
-            if (dev->cell_live && !dev->twin)
-                return MSGI;
-            if (dev->bus_state == BUS_BUSY) {
-                ret |= BSYI | dev->tgt_phase;
-                if (dev->tgt_req)
-                    ret |= REQI;
+            /* "Reads the actual state of the signals on the SCSI bus
+               pins." A pin is asserted when it is at ground, so a control
+               line the board ties low reads as a one here whatever the
+               bus is doing, and that is how the board tells the part --
+               and the option ROM -- what it is wired for. The book's
+               strap table, by channel B's pins:
+
+                   Configuration    BBSY-  BCD-  BMSG-
+                   DualBusses       VDD    VDD   VDD
+                   Channel A only   VDD    VDD   GND
+                   Wide             VDD    GND   don't care
+
+               so on a board with one narrow connector, channel B's file
+               shows MSG asserted and BSY and C/D negated with nothing
+               else driven: the ROM sets SELBUSB, reads here, and takes
+               MSG without BSY as no second channel (x86 1E07h) and C/D
+               with MSG as a differential board (1F63h). A wide board
+               grounds BCD-, but SELWIDE clears SELBUSB, so its channel B
+               pins are never in front of the file. */
+            ret = aic_strap_pins(dev, dev->cell_live);
+            if (ret == 0) {
+                if (dev->bus_state == BUS_BUSY) {
+                    ret |= BSYI | dev->tgt_phase;
+                    if (dev->tgt_req)
+                        ret |= REQI;
+                }
+                if (dev->selecting)
+                    ret |= SELI;
+                if (dev->atn)
+                    ret |= ATNI;
+                /* These are the pins, so what we drive ourselves shows too. */
+                ret |= dev->scsisigo & (SELI | BSYI | ACKI);
             }
-            if (dev->selecting)
-                ret |= SELI;
-            if (dev->atn)
-                ret |= ATNI;
-            /* These are the pins, so what we drive ourselves shows too. */
-            ret |= dev->scsisigo & (SELI | BSYI | ACKI);
+            if (!seq && (dev->sig_logs < 64)) {
+                dev->sig_logs++;
+                aic_log(dev->tag, "host reads SCSISIGI = %02x on channel %c (sblkctl %02x, bus %s)\n",
+                        ret, dev->cell_live ? 'B' : 'A', dev->sblkctl,
+                        (dev->bus_state == BUS_BUSY) ? "busy" : "free");
+            }
             return ret;
         case SCSIRATE:
             return dev->scsirate;
@@ -3124,6 +3173,11 @@ aic_write(aic7xxx_t *dev, uint8_t addr, uint8_t val, int seq)
 
                 dev->sblkctl = val & dev->chip->sblkctl_mask & ~forced;
                 aic_cell_swap(dev, (dev->sblkctl & SELBUSB) ? 1 : 0);
+                if (!seq && (dev->sig_logs < 64)) {
+                    dev->sig_logs++;
+                    aic_log(dev->tag, "host: SBLKCTL %02x -> %02x, channel %c in front\n",
+                            val, dev->sblkctl, dev->cell_live ? 'B' : 'A');
+                }
             }
             break;
         case SCSITEST:
@@ -4029,7 +4083,7 @@ static void
 aic_chip_reset(aic7xxx_t *dev)
 {
     aic_log(dev->tag, "chip reset\n");
-    dev->busl_reads = dev->rom_writes = dev->hcntrl_logs = 0;
+    dev->busl_reads = dev->rom_writes = dev->hcntrl_logs = dev->sig_logs = 0;
 
     timer_stop(&dev->seq_timer);
     timer_stop(&dev->sel_timer);
