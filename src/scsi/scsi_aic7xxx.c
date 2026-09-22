@@ -2027,8 +2027,8 @@ aic_select_done(void *priv)
        selection runs. */
     if (aic_ch_scsiseq(dev, dev->sel_ch) & ENAUTOATNO)
         dev->atn = 1;
-    aic_log(dev->tag, "select %i: ok (atn %i) scb%u ctl %02x tcl %02x cmdlen %02x\n", id,
-            dev->atn, dev->scbptr & (dev->chip->scb_pages - 1),
+    aic_log(dev->tag, "select %i: ok on channel %c (atn %i, sblkctl %02x) scb%u ctl %02x tcl %02x cmdlen %02x\n", id,
+            dev->sel_ch ? 'B' : 'A', dev->atn, dev->sblkctl, dev->scbptr & (dev->chip->scb_pages - 1),
             dev->scb[dev->scbptr & (dev->chip->scb_pages - 1)][0x00],
             dev->scb[dev->scbptr & (dev->chip->scb_pages - 1)][0x01],
             dev->scb[dev->scbptr & (dev->chip->scb_pages - 1)][0x18]);
@@ -2057,38 +2057,32 @@ aic_reselect_try(aic7xxx_t *dev)
     if (aic_ch_scsiseq(dev, aic_ch_of_bus(dev, c->bus)) & ENAUTOATNI)
         dev->atn = 1;
 
-    /* Which channel the target came back on, latched into SBLKCTL before
-       the reselection is reported.
+    /* The reconnection is reported on the cell of the channel the target
+       is wired to, and nowhere else: SELDI goes into that cell's SSTAT0,
+       and SBLKCTL is left exactly as the firmware had it. The firmware
+       does its own looking. Its poll loop flips SELBUSB every pass --
+       "xor SBLKCTL, SELBUSB" sits between the SELDO and SELDI tests --
+       so a reconnection on either channel is seen within two passes, on
+       the pass that has that cell in front, and the identify message and
+       the SCB search that follow (01Dh, 034h) read the channel out of the
+       SBLKCTL the firmware set itself.
 
-       The firmware needs that and cannot work it out. Its poll loop flips
-       SELBUSB every pass -- "xor SBLKCTL, SELBUSB" sits between the two
-       status tests -- so by the time a reselection arrives the bit is
-       whichever way the last flip left it. What it then does, at
-       sequencer address 01Dh, is walk its four SCBs looking for one that
-       is active and whose channel bit agrees with SBLKCTL, and if none
-       does it reports INTCODE 8 and stops. A coin toss decided whether
-       the search could succeed.
-
-       Real hardware switches the register file to the channel the
-       reconnection happened on, which is what makes the comparison mean
-       anything; only a part with the bit has a channel to switch. On a
-       board wired for one the answer is always channel A, and saying so
-       is what lets a single-channel card finish a reselection at all. */
-    if (dev->chip->sblkctl_mask & SELBUSB) {
-        uint8_t ch = aic_ch_of_bus(dev, c->bus);
-
-        if (ch)
-            dev->sblkctl |= SELBUSB;
-        else
-            dev->sblkctl &= ~SELBUSB;
-        aic_cell_swap(dev, ch);
-    }
+       An earlier pass here switched SBLKCTL and the register file to the
+       target's channel on the firmware's behalf, on the claim that the
+       hardware does. The book gives SBLKCTL no such behaviour, and on a
+       twin board the switch landed in the middle of the firmware's
+       selection setup for the other channel: SCSIID had gone to channel
+       A and the SCSISEQ write that started the selection went to channel
+       B, which then selected ID 0 with no SCB behind it, INTCODE 8, and
+       a bus reset for every command Windows 98 ran on the two channels
+       together. The switch was only ever needed while SELDI lived in a
+       single register file; with a cell per channel it is not. */
     dev->cur_ch = aic_ch_of_bus(dev, c->bus);
     aic_ch_selid(dev, dev->cur_ch, (uint8_t) (c->id << 4));
 
-    aic_log(dev->tag, "[%.3f ms] reselect %i lun %i tag %02x on channel %c\n",
+    aic_log(dev->tag, "[%.3f ms] reselect %i lun %i tag %02x on channel %c (sblkctl %02x)\n",
             aic_now_us() / 1000.0, c->id, c->lun, c->tagged ? c->tag : 0xff,
-            (dev->sblkctl & SELBUSB) ? 'B' : 'A');
+            dev->cur_ch ? 'B' : 'A', dev->sblkctl);
     aic_ch_sstat0(dev, dev->cur_ch, SELDI, 0);
 
     /* A reconnecting target identifies itself, and if the command was
@@ -3452,6 +3446,15 @@ aic_write(aic7xxx_t *dev, uint8_t addr, uint8_t val, int seq)
         case INTSTAT:
             /* The sequencer writes its interrupt code here. */
             aic_log(dev->tag, "[%.3f ms] seq: intstat %02x at %03x\n", aic_now_us() / 1000.0, val, dev->pc);
+            if ((val & 0xf1) == 0x81) {
+                /* INTCODE 8, no SCB matched: what the walk had to choose from. */
+                aic_log(dev->tag, "  no SCB for channel %c: sblkctl %02x sstat0 %02x (other cell %02x) scb0 %02x/%02x scb1 %02x/%02x scb2 %02x/%02x scb3 %02x/%02x bus %u selecting %u sel_ch %u cur_ch %u\n",
+                        (dev->sblkctl & SELBUSB) ? 'B' : 'A', dev->sblkctl, dev->sstat0,
+                        dev->cell_save[dev->cell_live ^ 1].sstat0,
+                        dev->scb[0][0], dev->scb[0][1], dev->scb[1][0], dev->scb[1][1],
+                        dev->scb[2][0], dev->scb[2][1], dev->scb[3][0], dev->scb[3][1],
+                        dev->bus_state, dev->selecting, dev->sel_ch, dev->cur_ch);
+            }
 #ifdef ENABLE_AIC7XXX_LOG
             /* Anything but a plain command complete or the delay timer:
                say how it got here. */
