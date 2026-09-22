@@ -4874,7 +4874,7 @@ aic_pci_write(int func, int addr, UNUSED(int len), uint8_t val, void *priv)
 
 #define AHA2940UW_V123_ROM "roms/scsi/adaptec/aha2940uw_v123.bin"
 #define AHA2940UW_V125_ROM "roms/scsi/adaptec/aha2940uw_v125.bin"
-#define AHA2940U_1995_ROM  "roms/scsi/adaptec/aha2940u_1995_589219-00c.bin"
+#define AHA2940UW_V121_ROM "roms/scsi/adaptec/aha2940uw_v121.bin"
 #define AHA2940UW_V134_ROM "roms/scsi/adaptec/aha2940uw_v134.bin"
 #define AHA2940UW_V220_ROM "roms/scsi/adaptec/aha2940uw_v220.bin"
 #define AHA2740_V210_ROM   "roms/scsi/adaptec/aha2740_v210.bin"
@@ -5370,22 +5370,13 @@ static const device_config_t aic_card_config[] = {
         .spinner        = { 0 },
         .bios           = {
             {
-                .name          = "Version 1.23",
-                .internal_name = "v1_23",
-                .bios_type     = BIOS_NORMAL,
-                .files_no      = 1,
-                .local         = 0,
-                .size          = 65536,
-                .files         = { AHA2940UW_V123_ROM, "" }
-            },
-            {
-                .name          = "Version 1.2x (1995, 589219-00 C dump)",
-                .internal_name = "v1_2x_1995",
+                .name          = "Version 1.21",
+                .internal_name = "v1_21",
                 .bios_type     = BIOS_NORMAL,
                 .files_no      = 1,
                 .local         = 0,
                 .size          = 32768,
-                .files         = { AHA2940U_1995_ROM, "" }
+                .files         = { AHA2940UW_V121_ROM, "" }
             },
             {
                 .name          = "Version 1.25.0",
@@ -5413,6 +5404,15 @@ static const device_config_t aic_card_config[] = {
                 .local         = 0,
                 .size          = 65536,
                 .files         = { AHA2940UW_V220_ROM, "" }
+            },
+            {
+                .name          = "Version 1.23",
+                .internal_name = "v1_23",
+                .bios_type     = BIOS_NORMAL,
+                .files_no      = 1,
+                .local         = 0,
+                .size          = 65536,
+                .files         = { AHA2940UW_V123_ROM, "" }
             },
             { .files_no = 0 }
         },
