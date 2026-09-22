@@ -4875,7 +4875,6 @@ aic_pci_write(int func, int addr, UNUSED(int len), uint8_t val, void *priv)
 #define AHA2940UW_V123_ROM "roms/scsi/adaptec/aha2940uw_v123.bin"
 #define AHA2940UW_V125_ROM "roms/scsi/adaptec/aha2940uw_v125.bin"
 #define AHA2940U_1995_ROM  "roms/scsi/adaptec/aha2940u_1995_589219-00c.bin"
-#define AHA2940_V111_ROM   "roms/scsi/adaptec/aha2940_v111.bin"
 #define AHA2940UW_V134_ROM "roms/scsi/adaptec/aha2940uw_v134.bin"
 #define AHA2940UW_V220_ROM "roms/scsi/adaptec/aha2940uw_v220.bin"
 #define AHA2740_V210_ROM   "roms/scsi/adaptec/aha2740_v210.bin"
@@ -5370,15 +5369,6 @@ static const device_config_t aic_card_config[] = {
         .file_filter    = NULL,
         .spinner        = { 0 },
         .bios           = {
-            {
-                .name          = "Version 1.11 (AHA-2940, AIC-7870 BIOS)",
-                .internal_name = "v1_11",
-                .bios_type     = BIOS_NORMAL,
-                .files_no      = 1,
-                .local         = 0,
-                .size          = 32768,
-                .files         = { AHA2940_V111_ROM, "" }
-            },
             {
                 .name          = "Version 1.23",
                 .internal_name = "v1_23",
