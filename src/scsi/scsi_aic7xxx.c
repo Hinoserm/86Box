@@ -747,20 +747,20 @@ typedef struct aic7xxx_t {
 static uint8_t
 aic_cur_bus(const aic7xxx_t *dev)
 {
-    return ((dev->sblkctl & SELBUSB) && dev->twin) ? dev->bus_b : dev->bus;
+    return (dev->sblkctl & SELBUSB) ? dev->bus_b : dev->bus;
 }
 
 /* Which channel a bus is, and which bus a channel is. */
 static uint8_t
 aic_ch_of_bus(const aic7xxx_t *dev, uint8_t bus)
 {
-    return (dev->twin && (bus == dev->bus_b)) ? 1 : 0;
+    return ((dev->bus_b != dev->bus) && (bus == dev->bus_b)) ? 1 : 0;
 }
 
 static uint8_t
 aic_bus_of_ch(const aic7xxx_t *dev, uint8_t ch)
 {
-    return (ch && dev->twin) ? dev->bus_b : dev->bus;
+    return ch ? dev->bus_b : dev->bus;
 }
 
 static void aic_update_irq(aic7xxx_t *dev);
@@ -1016,7 +1016,10 @@ aic_hard_error(aic7xxx_t *dev, uint8_t bits, uint8_t addr, int write)
 static void
 aic_scsi_int(aic7xxx_t *dev)
 {
-    if ((dev->sstat0 & dev->simode0) || (dev->sstat1 & dev->simode1)) {
+    /* Against SSTAT0 as the sequencer would read it: SDONE and DMADONE are
+       computed on the way out, and ENSDONE and ENDMADONE are interrupt
+       enables like the others. */
+    if ((aic_read(dev, SSTAT0, 1) & dev->simode0) || (dev->sstat1 & dev->simode1)) {
         if (!(dev->intstat & SCSIINT)) {
             aic_log(dev->tag, "scsiint: sstat0 %02x&%02x sstat1 %02x&%02x at pc %03x\n",
                     dev->sstat0, dev->simode0, dev->sstat1, dev->simode1, dev->pc);
@@ -1229,9 +1232,16 @@ aic_bus_free(aic7xxx_t *dev)
     dev->atn       = 0;
     dev->datl_full = 0;
     dev->req_wait  = 0;
-    /* Bus free takes SCSISIGO, SELDO and SELDI with it. */
-    dev->scsisigo = 0;
-    dev->sstat0 &= ~(SELDO | SELDI);
+    /* Bus free takes SCSISIGO, SELDO and SELDI with it -- on the cell
+       the connection was on, which is not necessarily the one the file
+       is switched to. */
+    if (dev->cur_ch == dev->cell_live) {
+        dev->scsisigo = 0;
+        dev->sstat0 &= ~(SELDO | SELDI);
+    } else {
+        dev->cell_save[dev->cur_ch].scsisigo = 0;
+        dev->cell_save[dev->cur_ch].sstat0 &= (uint8_t) ~(SELDO | SELDI);
+    }
     dev->msgin_len = dev->msgin_pos = 0;
     dev->msgout_len                 = 0;
     timer_stop(&dev->tgt_timer);
@@ -1872,15 +1882,18 @@ aic_select_done(void *priv)
         return;
     }
 
-    aic_ch_sstat0(dev, dev->sel_ch, 0, SELINGO);
     dev->selecting = 0;
 
     if (!(aic_ch_scsiseq(dev, dev->sel_ch) & ENSELO)) {
+        aic_ch_sstat0(dev, dev->sel_ch, 0, SELINGO);
         aic_bus_changed(dev);
         return;
     }
 
     if ((sd == NULL) || !scsi_device_present(sd)) {
+        /* SELINGO stays: the book clears it "when a successful selection
+           has been completed (SELDO is one)" or by CLRSELINGO, and a
+           timeout is neither. SEL comes off the bus and SELTO says why. */
         aic_log(dev->tag, "select %i: timeout on channel %c\n", id,
                 dev->sel_ch ? 'B' : 'A');
         aic_ch_sstat1(dev, dev->sel_ch, SELTO, 0);
@@ -1898,6 +1911,9 @@ aic_select_done(void *priv)
     c->id  = id;
     c->bus = aic_bus_of_ch(dev, dev->sel_ch);
 
+    /* "When a successful selection has been completed (SELDO is one),
+       this bit will be cleared." */
+    aic_ch_sstat0(dev, dev->sel_ch, 0, SELINGO);
     dev->cur_ch    = dev->sel_ch;
     dev->cur       = c;
     dev->bus_state = BUS_BUSY;
@@ -1940,7 +1956,7 @@ aic_reselect_try(aic7xxx_t *dev)
     c->waited      = 0;
     dev->cur       = c;
     dev->bus_state = BUS_BUSY;
-    if (dev->scsiseq & ENAUTOATNI)
+    if (aic_ch_scsiseq(dev, aic_ch_of_bus(dev, c->bus)) & ENAUTOATNI)
         dev->atn = 1;
 
     /* Which channel the target came back on, latched into SBLKCTL before
@@ -2381,6 +2397,15 @@ aic_read(aic7xxx_t *dev, uint8_t addr, int seq)
             return dev->sxfrctl1;
         case SCSISIG: /* SCSISIGI: what is actually on the wires */
             ret = 0;
+            /* A channel the board does not bring out has its control
+               pins tied, and the register reads the pins: "BMSG-=GND and
+               BBSY-=VDD indicates that Channel B is not being used", so
+               switched to it the file shows MSG asserted and BSY negated
+               with nothing else driven. That is what the option ROM
+               looks for when it counts channels -- it sets SELBUSB,
+               reads here, and takes MSG without BSY as no channel. */
+            if (dev->cell_live && !dev->twin)
+                return MSGI;
             if (dev->bus_state == BUS_BUSY) {
                 ret |= BSYI | dev->tgt_phase;
                 if (dev->tgt_req)
@@ -2407,25 +2432,26 @@ aic_read(aic7xxx_t *dev, uint8_t addr, int seq)
                     aic_log(dev->tag, "%s reads SCSIDATL = %02x (phase %s, msgin %u/%u, "
                             "spioen %u -> %s)\n", seq ? "seq" : "host", ret,
                             aic_phase_name(dev->tgt_phase), dev->msgin_pos, dev->msgin_len,
-                            !!(dev->sxfrctl0 & SPIOEN), "acked");
+                            !!(dev->sxfrctl0 & SPIOEN),
+                            (dev->sxfrctl0 & SPIOEN) ? "acked" : "NOT acked");
                 }
-                /* The read is the handshake, automatic PIO or not. The
-                   register's own description: a latch "used to transfer
-                   data on the SCSI bus during Automatic or Manual SCSI
-                   PIO transfer. The SCSI ACK (as Initiator) or REQ (as
-                   Target) is driven active when the write or read
-                   occurs." SPIOEN adds SPIORDY and the automatic re-REQ
-                   on top -- "may be left on during Normal transfers
-                   without adverse effect" -- it is not what makes the
-                   ACK. Gating the ACK on it left a byte standing whenever
-                   the firmware read with it off, and a target with a byte
-                   still unacknowledged never moves. The count, though,
-                   is automatic PIO's: STCNT counts ACKs the hardware
-                   sends for the sequencer, and a manual handshake is not
-                   one of those. */
-                if (dev->sxfrctl0 & SPIOEN)
+                /* The handshake is automatic PIO's, and SPIOEN is what
+                   turns that on: "The individual PIO transfers are
+                   triggered by reading or writing to SCSIDATL register
+                   ... Writing a zero to this bit will stop any further
+                   PIO transfers without corrupting any valid data in the
+                   SCSIDATL register." Manual mode is the other thing --
+                   the book has it done "via the SCSI data latch registers
+                   SCSIBUSL and SCSIBUSH" with the handshake driven by
+                   hand through SCSISIGO, which is ACKO below. So with
+                   SPIOEN clear a read here is only a look at the latch.
+                   An earlier pass removed this gate on the strength of
+                   the SCSIDATL description alone; the SPIOEN text is the
+                   more specific and it puts the gate back. */
+                if (dev->sxfrctl0 & SPIOEN) {
                     aic_pio_counted(dev);
-                aic_tgt_acked(dev);
+                    aic_tgt_acked(dev);
+                }
             } else
                 ret = dev->scsidatl;
             return ret;
@@ -2449,6 +2475,9 @@ aic_read(aic7xxx_t *dev, uint8_t addr, int seq)
                 if (dev->hcnt == 0)
                     ret |= DMADONE;
             }
+            /* "This bit sets SDONE when it is set." */
+            if (dev->sstat0 & SPIORDY)
+                ret |= SDONE;
             return ret;
         case SSTAT1:
             return dev->sstat1;
@@ -3079,8 +3108,15 @@ aic_write(aic7xxx_t *dev, uint8_t addr, uint8_t val, int seq)
             {
                 uint8_t forced = 0;
 
-                if (!dev->twin)
-                    forced |= SELBUSB;   /* no channel B to switch to */
+                /* Not forced by a missing connector. The strap note --
+                   "BMSG-=GND and BBSY-=VDD indicates that Channel B is
+                   not being used and will force SELBUSB and SELWIDE to
+                   be cleared" -- is about what the register comes up
+                   holding ("may be initialized on Chip Reset"), and the
+                   AHA-2740's own option ROM settles it: to count its
+                   channels it sets SELBUSB, reads SCSISIGI, and only
+                   then decides (x86 1DF5h-1E19h). A bit that would not
+                   move could not be probed that way. */
                 if (!dev->wide)
                     forced |= SELWIDE;
                 if (val & SELWIDE)
@@ -4748,10 +4784,13 @@ aic_init(const device_t *info)
        its own SCSICONF: !ADP7771.CFG declares IOPORT(3) as a word, so the
        firmware writes 5Ah and 5Bh together and the board comes up with both
        channels configured. */
-    dev->bus_b = dev->twin ? scsi_get_bus() : dev->bus;
+    /* Channel B is the chip's whether or not the board brings it out,
+       and it is a bus of its own either way: on a one connector board it
+       is simply one with nothing on it, where a selection times out. */
+    dev->bus_b = (dev->chip->sblkctl_mask & SELBUSB) ? scsi_get_bus() : dev->bus;
 
     scsi_bus_set_speed(dev->bus, 20000000.0);
-    if (dev->twin)
+    if (dev->bus_b != dev->bus)
         scsi_bus_set_speed(dev->bus_b, 20000000.0);
 
     /* The on-board part answers as the bare chip; the cards carry the
