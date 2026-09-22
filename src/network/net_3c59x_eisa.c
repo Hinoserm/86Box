@@ -297,6 +297,7 @@ typedef struct tc59x_t {
     uint8_t  irq;       /* from ResourceConfig; 0 is disabled */
     uint8_t  irq_state; /* the PIC's level tracking */
     uint8_t  latch;     /* interruptLatch */
+    uint8_t  irq_logged;
     uint16_t int_status; /* the sources, unfiltered */
     uint16_t int_enable;
     uint16_t ind_enable;
@@ -502,6 +503,8 @@ tc59x_irq_of(uint16_t resource_config)
    re-set the moment any of them is still standing after the acknowledge,
    which is what keeps a driver that acknowledges before it has drained
    everything from losing the rest. */
+static uint16_t tc59x_int_status(const tc59x_t *dev);
+
 static void
 tc59x_update_irq(tc59x_t *dev)
 {
@@ -518,6 +521,10 @@ tc59x_update_irq(tc59x_t *dev)
         picintlevel(1 << dev->irq, &dev->irq_state);
     else
         picintclevel(1 << dev->irq, &dev->irq_state);
+    if (dev->latch != dev->irq_logged) {
+        dev->irq_logged = dev->latch;
+        tc59x_log("3C59x: IRQ %i %s (status %04x)\n", dev->irq, dev->latch ? "up" : "down", tc59x_int_status(dev));
+    }
 }
 
 static void
@@ -676,10 +683,15 @@ tc59x_rx(void *priv, uint8_t *buf, int io_len)
     uint16_t          len = (uint16_t) io_len;
     uint32_t          crc;
 
-    if (!dev->rx_enabled || (io_len < 14))
+    if (!dev->rx_enabled || (io_len < 14)) {
+        tc59x_log("3C59x: receiver off, %i byte frame dropped\n", io_len);
         return 1;
-    if (!tc59x_rx_accept(dev, buf))
+    }
+    if (!tc59x_rx_accept(dev, buf)) {
+        tc59x_log("3C59x: filtered (%02x) %i bytes to %02x:%02x:%02x:%02x:%02x:%02x\n", dev->rx_filter, io_len,
+                  buf[0], buf[1], buf[2], buf[3], buf[4], buf[5]);
         return 1;
+    }
 
     if (len > NET_MAX_FRAME)
         len = NET_MAX_FRAME;
@@ -714,6 +726,8 @@ tc59x_rx(void *priv, uint8_t *buf, int io_len)
     tc59x_stat_frames(dev, &dev->frames_rcvd_ok);
     tc59x_stat_bytes(dev, &dev->bytes_rcvd_ok, f->len);
 
+    tc59x_log("3C59x: received %u bytes, %u queued, intstatus %04x enables %04x/%04x\n", f->len, dev->rx_count,
+              tc59x_int_status(dev), dev->int_enable, dev->ind_enable);
     tc59x_rx_indicate(dev);
     return 1;
 }
@@ -864,6 +878,7 @@ tc59x_tx_data_write(tc59x_t *dev, uint8_t val)
     if (dev->tx_pad_left) {
         /* Padding out the previous frame to its dword boundary. */
         dev->tx_pad_left--;
+        tc59x_log("3C59x: pad byte %02x swallowed\n", val);
         return;
     }
     if (dev->tx_fsh_got < 4) {
@@ -873,6 +888,8 @@ tc59x_tx_data_write(tc59x_t *dev, uint8_t val)
             dev->tx_length = fsh & FSH_LENGTH;
             dev->tx_flags  = fsh & (FSH_TX_INDICATE | FSH_CRC_DISABLE);
             dev->tx_got    = 0;
+            tc59x_log("3C59x: fsh %02x %02x %02x %02x: length %u flags %04x\n", dev->tx_fsh[0], dev->tx_fsh[1],
+                      dev->tx_fsh[2], dev->tx_fsh[3], dev->tx_length, dev->tx_flags);
             if (dev->tx_length > TX_FRAME_MAX) {
                 tc59x_log("3C59x: frame start header asks for %u bytes\n", dev->tx_length);
                 dev->tx_length = TX_FRAME_MAX;
@@ -891,9 +908,13 @@ tc59x_tx_data_write(tc59x_t *dev, uint8_t val)
     dev->tx_frame[dev->tx_got++] = val;
     if (dev->tx_got == dev->tx_length) {
         /* Complete. Whatever the driver writes to reach the dword
-           boundary is pad and is swallowed; TxDone would end it early. */
-        dev->tx_pad_left = (uint8_t) ((4 - (dev->tx_length & 3)) & 3);
+           boundary is pad and is swallowed; TxDone would end it early.
+           The pad count is set after the send, which starts the next
+           frame's state afresh. */
+        uint8_t pad = (uint8_t) ((4 - (dev->tx_length & 3)) & 3);
+
         tc59x_tx_send(dev);
+        dev->tx_pad_left = pad;
     }
 }
 
@@ -903,6 +924,7 @@ tc59x_tx_data_write(tc59x_t *dev, uint8_t val)
 static void
 tc59x_tx_done(tc59x_t *dev)
 {
+    tc59x_log("3C59x: TxDone: fsh %u/4, %u/%u bytes, pad left %u\n", dev->tx_fsh_got, dev->tx_got, dev->tx_length, dev->tx_pad_left);
     dev->tx_pad_left = 0;
     if ((dev->tx_fsh_got == 4) && (dev->tx_got > 0) && (dev->tx_got < dev->tx_length)) {
         /* A short frame against its own header: send what there is. */
@@ -954,6 +976,9 @@ tc59x_dma_download(tc59x_t *dev)
 {
     uint8_t  buf[64];
     uint16_t n;
+
+    tc59x_log("3C59x: download %u bytes from %08x (fsh %u/4, %u/%u so far, pad left %u)\n", dev->master_len,
+              dev->master_address, dev->tx_fsh_got, dev->tx_got, dev->tx_length, dev->tx_pad_left);
 
     while (dev->master_len) {
         n = dev->master_len;
