@@ -20,6 +20,12 @@
 extern const device_t aic7880_pci_device;
 extern const device_t aha2940u_pci_device;
 extern const device_t aha2940uw_pci_device;
+extern const device_t aha2740_device;
 extern const device_t aha2742_device;
+extern const device_t aha2740t_device;
+extern const device_t aha2742t_device;
+extern const device_t aha2740w_device;
+extern const device_t aha2742w_device;
+extern const device_t aha2744w_device;
 
 #endif /*SCSI_AIC7XXX_H*/

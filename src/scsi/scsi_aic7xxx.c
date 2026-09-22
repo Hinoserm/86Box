@@ -83,6 +83,7 @@
 #include <86box/scsi_device.h>
 #include <86box/pic.h>
 #include <86box/eisa.h>
+#include <86box/fdc.h>
 #include <86box/scsi_aic7xxx.h>
 #include <86box/plat_unused.h>
 
@@ -227,7 +228,23 @@ aic_log(const char *tag, const char *fmt, ...)
 #define BOARD_7880         0 /* the chip on a motherboard */
 #define BOARD_2940U        1 /* AHA-2940 Ultra, narrow */
 #define BOARD_2940UW       2 /* AHA-2940 Ultra Wide */
-#define BOARD_2742        3 /* AHA-2742, an AIC-7770 on EISA, one narrow bus, no floppy */
+/* The AIC-7770 cards. The configuration utility's overlay knows four
+   hardware types by the chip's straps -- AHA-2740/2742, 2740T/2742T,
+   2740W/2742W and 2744W -- and the second digit says whether the board
+   carries a floppy controller (an N82077 on Hino's). Same EISA ID
+   (ADP7771) and the same option ROM throughout. */
+#define BOARD_2740         3 /* one narrow channel */
+#define BOARD_2742         4 /* one narrow channel, floppy controller */
+#define BOARD_2740T        5 /* two narrow channels */
+#define BOARD_2742T        6 /* two narrow channels, floppy controller */
+#define BOARD_2740W        7 /* one wide channel */
+#define BOARD_2742W        8 /* one wide channel, floppy controller */
+#define BOARD_2744W        9 /* one wide differential channel */
+#define AIC_BOARD_EISA(b)  ((b) >= BOARD_2740)
+#define AIC_BOARD_TWIN(b)  (((b) == BOARD_2740T) || ((b) == BOARD_2742T))
+#define AIC_BOARD_WIDE(b)  (((b) == BOARD_2740W) || ((b) == BOARD_2742W) || ((b) == BOARD_2744W))
+#define AIC_BOARD_DIFF(b)  ((b) == BOARD_2744W)
+#define AIC_BOARD_FDC(b)   (((b) == BOARD_2742) || ((b) == BOARD_2742T) || ((b) == BOARD_2742W))
 
 #define SRAM_BASE    0x20 /* scratch RAM, to 0x5f */
 
@@ -590,6 +607,8 @@ typedef struct aic7xxx_t {
     uint8_t       bus;
     uint8_t       wide;
     uint8_t       twin;  /* the board is wired for two SCSI buses */
+    uint8_t       diff;  /* differential transceivers on channel A */
+    void         *fdc;   /* the floppy controller a 2742 carries, when jumpered on */
     uint8_t       bus_b; /* and the second one it is wired to */
     uint8_t       eisa_id[4];
     const aic_chip_t *chip;
@@ -1170,8 +1189,13 @@ aic_strap_pins(const aic7xxx_t *dev, uint8_t ch)
 {
     if (ch == 0)
         return 0;
+    /* DualBusses: nothing tied, the register reads channel B's bus. */
     if (dev->twin)
         return 0;
+    /* Wide: BCD- grounded -- but SELWIDE clears SELBUSB, so channel B's
+       file is never in front and this is not reached. */
+    if (dev->wide)
+        return CDI;
     /* One narrow connector: BMSG- grounded, BBSY- and BCD- at VDD. */
     return MSGI;
 }
@@ -2503,6 +2527,13 @@ aic_read(aic7xxx_t *dev, uint8_t addr, int seq)
                grounds BCD-, but SELWIDE clears SELBUSB, so its channel B
                pins are never in front of the file. */
             ret = aic_strap_pins(dev, dev->cell_live);
+            /* A differential board's transceivers sit between the pins
+               and the bus, and with the bus free the option ROM reads
+               C/D and MSG asserted through them -- that is its test for
+               a differential board (x86 1F63h), made on channel A after
+               a SELBUSB write that SELWIDE has cleared. */
+            if ((ret == 0) && dev->diff && (dev->cell_live == 0) && (dev->bus_state != BUS_BUSY) && !dev->selecting)
+                ret = CDI | MSGI;
             if (ret == 0) {
                 if (dev->bus_state == BUS_BUSY) {
                     ret |= BSYI | dev->tgt_phase;
@@ -4231,7 +4262,7 @@ aic_chip_reset(aic7xxx_t *dev)
        channel B for the firmware to go looking at. A board with two
        connectors would come up 08h, and that belongs to the board rather
        than to the chip. */
-    dev->sblkctl = dev->chip->sblkctl_reset | (dev->wide ? SELWIDE : 0);
+    dev->sblkctl = dev->chip->sblkctl_reset | (dev->wide ? SELWIDE : 0) | (dev->twin ? SELBUSB : 0);
     /* Both cells come up empty, and the file starts on whichever channel
        the straps named. */
     memset(dev->cell_save, 0, sizeof(dev->cell_save));
@@ -4934,7 +4965,7 @@ aic_init(const device_t *info)
     uint16_t                 devid;
 
     dev->board = info->local & 0xff;
-    dev->wide  = (dev->board == BOARD_2940UW) || (dev->board == BOARD_7880);
+    dev->wide  = (dev->board == BOARD_2940UW) || (dev->board == BOARD_7880) || AIC_BOARD_WIDE(dev->board);
     /* An AHA-2740 is one narrow bus. Other members of the family strap the
        same chip for two buses or for one wide one, and on the AIC-7770
        those are exclusive: the wide connection takes channel B's data
@@ -4957,7 +4988,8 @@ aic_init(const device_t *info)
        nothing on it and times out, on channel B's own SSTAT1, and the ROM
        carries on. That needs the register file to be per channel, which
        aic_cell_t and aic_cell_swap() now make it. */
-    dev->twin  = 0;
+    dev->twin  = AIC_BOARD_TWIN(dev->board);
+    dev->diff  = AIC_BOARD_DIFF(dev->board);
     /* NOT a second connector, after all -- and the data book had it
        right. The v2.11 option ROM decides the channel count at init by
        reading SBLKCTL back and testing SELBUSB (x86 at 3636h): on a board
@@ -4968,7 +5000,7 @@ aic_init(const device_t *info)
        The two cells are still modelled for a board that has both; what
        decides is the strap, and this card's is one connector. */
 
-    dev->eisa  = (dev->board == BOARD_2742);
+    dev->eisa  = AIC_BOARD_EISA(dev->board);
     /* Which part this board is built on, before anything asks. */
     dev->chip  = dev->eisa ? &aic_chip_7770 : &aic_chip_788x;
     dev->bus   = scsi_get_bus();
@@ -5183,6 +5215,12 @@ aic_init(const device_t *info)
         pci_add_card((dev->board == BOARD_7880) ? PCI_ADD_SCSI : PCI_ADD_NORMAL,
                      aic_pci_read, aic_pci_write, dev, &dev->pci_slot);
 
+    /* The 2742s carry a floppy controller behind an enable jumper, off by
+       default here because the machine's own controller answers at the
+       same address: enable it only with the machine's disabled. */
+    if (AIC_BOARD_FDC(dev->board) && device_get_config_int("floppy"))
+        dev->fdc = device_add(&fdc_at_device);
+
     if (dev->twin)
         aic_log(dev->tag, "board %i, %s, channel A on bus %i, channel B on "
                 "bus %i, sblkctl %02x\n", dev->board,
@@ -5289,6 +5327,91 @@ static const device_config_t aic7770_config[] = {
     // clang-format on
 };
 
+static const device_config_t aic7770_fdc_config[] = {
+    // clang-format off
+    {
+        .name           = "bios_rev",
+        .description    = "BIOS Revision",
+        .type           = CONFIG_BIOS,
+        .default_string = "v2_11_edd",
+        .default_int    = 0,
+        .file_filter    = NULL,
+        .spinner        = { 0 },
+        .bios           = {
+            {
+                .name          = "Version 2.10",
+                .internal_name = "v2_10",
+                .bios_type     = BIOS_NORMAL,
+                .files_no      = 1,
+                .local         = 0,
+                .size          = 16384,
+                .files         = { AHA2740_V210_ROM, "" }
+            },
+            {
+                .name          = "Version 2.11 EDD 1.1",
+                .internal_name = "v2_11_edd",
+                .bios_type     = BIOS_NORMAL,
+                .files_no      = 1,
+                .local         = 0,
+                .size          = 32768,
+                .files         = { AHA2742A_V211_ROM, "" }
+            },
+            {
+                .name          = "Version 2.11 EDD 1.1 (2740W dump)",
+                .internal_name = "v2_11_edd_w",
+                .bios_type     = BIOS_NORMAL,
+                .files_no      = 1,
+                .local         = 0,
+                .size          = 32768,
+                .files         = { AHA2740W_V211_ROM, "" }
+            },
+            { .files_no = 0 }
+        }
+    },
+    {
+        .name           = "slot",
+        .description    = "EISA slot",
+        .type           = CONFIG_SELECTION,
+        .default_string = NULL,
+        .default_int    = 1,
+        .file_filter    = NULL,
+        .spinner        = { 0 },
+        .selection      = {
+            { .description = "Slot 1", .value = 1 },
+            { .description = "Slot 2", .value = 2 },
+            { .description = "Slot 3", .value = 3 },
+            { .description = "Slot 4", .value = 4 },
+            { .description = ""                   }
+        },
+        .bios           = { { 0 } }
+    },
+    {
+        .name           = "dev_timing",
+        .description    = "Model device access times",
+        .type           = CONFIG_BINARY,
+        .default_string = NULL,
+        .default_int    = 0,
+        .file_filter    = NULL,
+        .spinner        = { 0 },
+        .selection      = { { 0 } },
+        .bios           = { { 0 } }
+    },
+    {
+        .name           = "floppy",
+        .description    = "Floppy controller enabled (jumper)",
+        .type           = CONFIG_BINARY,
+        .default_string = NULL,
+        .default_int    = 0,
+        .file_filter    = NULL,
+        .spinner        = { 0 },
+        .selection      = { { 0 } },
+        .bios           = { { 0 } }
+    },
+    { .name = "", .description = "", .type = CONFIG_END }
+    // clang-format on
+};
+
+
 static const device_config_t aic_card_config[] = {
     // clang-format off
     {
@@ -5381,11 +5504,95 @@ const device_t aic7880_pci_device = {
     .config        = NULL
 };
 
+const device_t aha2740_device = {
+    .name          = "Adaptec AHA-2740",
+    .internal_name = "aha2740",
+    .flags         = DEVICE_EISA,
+    .local         = BOARD_2740,
+    .init          = aic_init,
+    .close         = aic_close,
+    .reset         = aic_reset,
+    .available     = NULL,
+    .speed_changed = NULL,
+    .force_redraw  = NULL,
+    .config        = aic7770_config
+};
+
 const device_t aha2742_device = {
     .name          = "Adaptec AHA-2742",
     .internal_name = "aha2742",
     .flags         = DEVICE_EISA,
     .local         = BOARD_2742,
+    .init          = aic_init,
+    .close         = aic_close,
+    .reset         = aic_reset,
+    .available     = NULL,
+    .speed_changed = NULL,
+    .force_redraw  = NULL,
+    .config        = aic7770_fdc_config
+};
+
+const device_t aha2740t_device = {
+    .name          = "Adaptec AHA-2740T",
+    .internal_name = "aha2740t",
+    .flags         = DEVICE_EISA,
+    .local         = BOARD_2740T,
+    .init          = aic_init,
+    .close         = aic_close,
+    .reset         = aic_reset,
+    .available     = NULL,
+    .speed_changed = NULL,
+    .force_redraw  = NULL,
+    .config        = aic7770_config
+};
+
+const device_t aha2742t_device = {
+    .name          = "Adaptec AHA-2742T",
+    .internal_name = "aha2742t",
+    .flags         = DEVICE_EISA,
+    .local         = BOARD_2742T,
+    .init          = aic_init,
+    .close         = aic_close,
+    .reset         = aic_reset,
+    .available     = NULL,
+    .speed_changed = NULL,
+    .force_redraw  = NULL,
+    .config        = aic7770_fdc_config
+};
+
+const device_t aha2740w_device = {
+    .name          = "Adaptec AHA-2740W",
+    .internal_name = "aha2740w",
+    .flags         = DEVICE_EISA,
+    .local         = BOARD_2740W,
+    .init          = aic_init,
+    .close         = aic_close,
+    .reset         = aic_reset,
+    .available     = NULL,
+    .speed_changed = NULL,
+    .force_redraw  = NULL,
+    .config        = aic7770_config
+};
+
+const device_t aha2742w_device = {
+    .name          = "Adaptec AHA-2742W",
+    .internal_name = "aha2742w",
+    .flags         = DEVICE_EISA,
+    .local         = BOARD_2742W,
+    .init          = aic_init,
+    .close         = aic_close,
+    .reset         = aic_reset,
+    .available     = NULL,
+    .speed_changed = NULL,
+    .force_redraw  = NULL,
+    .config        = aic7770_fdc_config
+};
+
+const device_t aha2744w_device = {
+    .name          = "Adaptec AHA-2744W",
+    .internal_name = "aha2744w",
+    .flags         = DEVICE_EISA,
+    .local         = BOARD_2744W,
     .init          = aic_init,
     .close         = aic_close,
     .reset         = aic_reset,
