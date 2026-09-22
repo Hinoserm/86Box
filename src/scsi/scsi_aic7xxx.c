@@ -1259,14 +1259,19 @@ aic_bus_changed(aic7xxx_t *dev)
     } else
         dev->sstat1 &= ~PHASEMIS;
 
-    /* SPIORDY is a LATCH, set on the leading edge of REQ while automatic
-       PIO is on, and it is not REQ. The data book has it fall again when
-       SCSIDATL is read or written; the silicon was not seen to do that, and
-       the 1996 firmware, which polls it, writes CLRSPIORDY before every
-       byte rather than trust it to. So it stays up until it is cleared, and
-       a program that takes it for "the target is asking" sends its second
-       byte before the target wanted one. REQINIT is what says that. */
-    if (req && !dev->req_seen && (dev->sxfrctl0 & SPIOEN))
+    /* SPIORDY is automatic PIO's: "As an initiator, this bit is set to
+       one on the leading edge of REQ", and only while SPIOEN is on and
+       no DMA engine has the bus -- "This bit may be left on even when in
+       DMA mode since SCSIEN or SDMAEN override this bit." It falls on
+       the SCSIDATL access that moves the byte, and on CLRSPIORDY, and
+       with SPIOEN. An earlier note here kept it up until cleared by hand
+       because one part's silicon was not seen to drop it; the book says
+       it drops, and a firmware that trusts the book -- Windows 98's
+       ARROW.MPD -- starts its command DMA, reads SSTAT0, finds SDONE
+       standing on a SPIORDY left over from the last message byte, and
+       cancels the transfer it just started. */
+    if (req && !dev->req_seen && (dev->sxfrctl0 & SPIOEN) &&
+        !(dev->dfcntrl & (SCSIEN | SDMAEN)))
         aic_set_sstat0(dev, SPIORDY);
     dev->req_seen = req;
 
@@ -2548,6 +2553,9 @@ aic_read(aic7xxx_t *dev, uint8_t addr, int seq)
                    the SCSIDATL description alone; the SPIOEN text is the
                    more specific and it puts the gate back. */
                 if (dev->sxfrctl0 & SPIOEN) {
+                    /* "During a transfer from SCSI, it is cleared on a
+                       read from SCSIDATL." */
+                    dev->sstat0 &= ~SPIORDY;
                     aic_pio_counted(dev);
                     aic_tgt_acked(dev);
                 }
@@ -3072,6 +3080,9 @@ aic_write(aic7xxx_t *dev, uint8_t addr, uint8_t val, int seq)
             aic_log(dev->tag, "pio out %02x (%s)\n", val,
                     (dev->bus_state == BUS_BUSY) ? aic_phase_name(dev->tgt_phase) : "free");
             dev->scsidatl = val;
+            /* "During a transfer to SCSI, the bit is cleared on a write to
+               SCSIDATL." */
+            dev->sstat0 &= ~SPIORDY;
             /* Automatic PIO is what SPIOEN enables. Adaptec's firmware
                loads the latch with it off and then turns it on, so the
                byte must wait here until it is. */
@@ -3505,6 +3516,12 @@ aic_write(aic7xxx_t *dev, uint8_t addr, uint8_t val, int seq)
                the engine off with a read-modify-write, and a reset bit
                that stuck would empty the FIFO it is about to read. */
             dev->dfcntrl = val & ~(FIFORESET | FIFOFLUSH);
+            /* "SCSIEN or SDMAEN override this bit": with a transfer
+               engine on, a REQ is the engine's to answer, not automatic
+               PIO's, and a SPIORDY standing from before must not read as
+               SDONE against a count that has just been loaded. */
+            if ((val & (SCSIEN | SDMAEN)) && !(was & (SCSIEN | SDMAEN)))
+                dev->sstat0 &= ~SPIORDY;
             if (val & FIFORESET)
                 aic_fifo_reset(dev);
             /* A flush by hand: nothing to do on an empty FIFO, and nothing
