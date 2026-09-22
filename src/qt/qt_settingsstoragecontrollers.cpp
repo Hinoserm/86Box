@@ -114,6 +114,14 @@ SettingsStorageControllers::restore()
 {
 }
 
+int
+SettingsStorageControllers::scsiCard(int i) const
+{
+    const QComboBox *cbox = findChild<QComboBox *>(QString("comboBoxSCSI%1").arg(i + 1));
+
+    return cbox ? cbox->currentData().toInt() : 0;
+}
+
 void
 SettingsStorageControllers::save(int soft)
 {
