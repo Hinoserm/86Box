@@ -265,7 +265,11 @@ aic_log(const char *tag, const char *fmt, ...)
    accepts the window. */
 #define AIC_BIOS_RAMEN    0x40
 #define AIC_BIOS_WRTPRT   0x80
-#define AIC_BIOS_RAMOFF   0x3f80
+/* The overlay is the last 128 bytes of the window, so where it starts
+   depends on how big the window is -- 3F80h in a sixteen kilobyte one,
+   7F80h in a thirty-two. Fixed at the sixteen kilobyte figure it landed
+   in the middle of a larger image, and the firmware's write-read test of
+   its own overlay failed with "Host Adapter shadow RAM test failure!". */
 #define AIC_BIOS_RAMSIZE  0x0080
 
 #define SEQCTL       0x60
@@ -534,6 +538,34 @@ typedef struct aic_cmd_t {
 
 #define AIC_CMDS 64
 
+/* One SCSI cell. The AIC-7770 has two of them and SBLKCTL's SELBUSB says
+   which one the register file is looking at: "When this bit is set, SCSI
+   Channel B is selected. Device addresses 00h-1Eh reflect the Channel B
+   registers. When this bit is cleared, addresses 00h-1Eh reflect Channel A
+   registers", both channels "mapped to the same I/O space".
+
+   The selected cell's registers are the live fields in aic7xxx_t, so
+   everything that works on "the channel we are switched to" needs no
+   changing; this holds the other one, and the two are swapped when
+   SELBUSB moves. What is deliberately NOT here is the data path -- the
+   FIFO, DFCNTRL, STCNT, HADDR and SHADDR -- and the sequencer and SCB
+   array. There is one of each of those, they are addressed outside
+   00h-1Eh, and only one channel can be transferring at a time. */
+typedef struct aic_cell_t {
+    uint8_t scsiseq;
+    uint8_t sxfrctl0;
+    uint8_t sxfrctl1;
+    uint8_t scsisigo;
+    uint8_t scsirate;
+    uint8_t scsiid;
+    uint8_t sstat0;
+    uint8_t sstat1;
+    uint8_t simode0;
+    uint8_t simode1;
+    uint8_t selid;
+    uint8_t scsitest;
+} aic_cell_t;
+
 typedef struct aic7xxx_t {
     /* PCI side */
     uint8_t       pci_slot;
@@ -548,6 +580,8 @@ typedef struct aic7xxx_t {
     rom_t         bios;
     uint8_t       has_bios;
     uint32_t      rom_reads;
+    uint32_t      rom_writes;
+    uint32_t      busl_reads;
     uint32_t      rom_size;
     uint8_t       bus;
     uint8_t       wide;
@@ -584,6 +618,17 @@ typedef struct aic7xxx_t {
     uint8_t  seectl;
     uint8_t  sblkctl;
     uint8_t  scsitest;
+
+    /* The cell the register file is not looking at, and which channel each
+       piece of bus business belongs to. A selection and a connection each
+       happen on one channel, and the firmware is free to have switched the
+       file away from it in the meantime -- its poll loop flips SELBUSB on
+       every pass -- so neither can be left to mean "whichever channel is
+       selected now". */
+    aic_cell_t cell_save[2];
+    uint8_t    cell_live; /* which channel the live registers are */
+    uint8_t    sel_ch;    /* the channel a selection in progress is on */
+    uint8_t    cur_ch;    /* and the channel the connection is on */
     uint8_t  sleepctl;
     uint8_t  must_step;  /* PAUSE was just released: one instruction runs whatever else is pending */
     uint8_t  timed_dev;  /* a device takes as long over a command as 86Box says it does */
@@ -691,6 +736,8 @@ typedef struct aic7xxx_t {
     pc_timer_t seq_timer;
     pc_timer_t sel_timer;
     pc_timer_t tgt_timer;
+    pc_timer_t req_timer;   /* the target's turnaround between message bytes */
+    uint8_t    tgt_held;    /* what the target left on the data lines after the last ACK */
 } aic7xxx_t;
 
 /* Channel A and channel B are two separate SCSI buses sharing one register
@@ -703,7 +750,22 @@ aic_cur_bus(const aic7xxx_t *dev)
     return ((dev->sblkctl & SELBUSB) && dev->twin) ? dev->bus_b : dev->bus;
 }
 
+/* Which channel a bus is, and which bus a channel is. */
+static uint8_t
+aic_ch_of_bus(const aic7xxx_t *dev, uint8_t bus)
+{
+    return (dev->twin && (bus == dev->bus_b)) ? 1 : 0;
+}
+
+static uint8_t
+aic_bus_of_ch(const aic7xxx_t *dev, uint8_t ch)
+{
+    return (ch && dev->twin) ? dev->bus_b : dev->bus;
+}
+
 static void aic_update_irq(aic7xxx_t *dev);
+static void aic_scsi_int(aic7xxx_t *dev);
+static uint8_t aic_tgt_byte(const aic7xxx_t *dev);
 static void aic_seq_kick(aic7xxx_t *dev);
 static void aic_seq_run(aic7xxx_t *dev);
 static void aic_pump(aic7xxx_t *dev);
@@ -718,6 +780,20 @@ static void aic_pio_out(aic7xxx_t *dev);
 static const char *aic_phase_name(uint8_t phase);
 #endif
 static uint8_t aic_read(aic7xxx_t *dev, uint8_t addr, int seq);
+
+/* 3F80h, and measured rather than reasoned about. It looks like it should
+   follow the size of the image -- the last 128 bytes of the window -- and
+   an earlier pass here made it do that. The v2.11 ROM is thirty-two
+   kilobytes and still writes its test pattern at +3F80, so the overlay is
+   the top of the first sixteen kilobytes whatever the image is, and
+   following the image put the window 16K away from where the firmware
+   reached for it: "Host Adapter shadow RAM test failure!" and no install.
+   The trace of those writes is below, which is how this was settled. */
+static uint32_t
+aic_bios_ramoff(UNUSED(const aic7xxx_t *dev))
+{
+    return 0x3f80;
+}
 static void    aic_write(aic7xxx_t *dev, uint8_t addr, uint8_t val, int seq);
 
 /* Emulated time, in microseconds. It moves a translated block at a time
@@ -972,6 +1048,114 @@ aic_set_sstat1(aic7xxx_t *dev, uint8_t bits)
     aic_scsi_int(dev);
 }
 
+/* Swapping the register file between the two cells. The live fields are
+   whichever channel SELBUSB names; this puts them away and brings the
+   other one out. */
+static void
+aic_cell_swap(aic7xxx_t *dev, uint8_t ch)
+{
+    aic_cell_t *out;
+    aic_cell_t *in;
+
+    if (ch == dev->cell_live)
+        return;
+
+    out = &dev->cell_save[dev->cell_live];
+    in  = &dev->cell_save[ch];
+
+    out->scsiseq  = dev->scsiseq;
+    out->sxfrctl0 = dev->sxfrctl0;
+    out->sxfrctl1 = dev->sxfrctl1;
+    out->scsisigo = dev->scsisigo;
+    out->scsirate = dev->scsirate;
+    out->scsiid   = dev->scsiid;
+    out->sstat0   = dev->sstat0;
+    out->sstat1   = dev->sstat1;
+    out->simode0  = dev->simode0;
+    out->simode1  = dev->simode1;
+    out->selid    = dev->selid;
+    out->scsitest = dev->scsitest;
+
+    dev->scsiseq  = in->scsiseq;
+    dev->sxfrctl0 = in->sxfrctl0;
+    dev->sxfrctl1 = in->sxfrctl1;
+    dev->scsisigo = in->scsisigo;
+    dev->scsirate = in->scsirate;
+    dev->scsiid   = in->scsiid;
+    dev->sstat0   = in->sstat0;
+    dev->sstat1   = in->sstat1;
+    dev->simode0  = in->simode0;
+    dev->simode1  = in->simode1;
+    dev->selid    = in->selid;
+    dev->scsitest = in->scsitest;
+
+    dev->cell_live = ch;
+
+    /* A status that was already standing on the channel just switched to
+       is what the interrupt logic sees now. Only the selected cell can
+       raise it: the firmware finds out which channel had the event by
+       switching to it, and an interrupt raised from the cell it is not
+       looking at would pause the sequencer before it could switch, with
+       nothing readable to clear. */
+    aic_scsi_int(dev);
+}
+
+/* Setting or clearing a status on a channel that may not be the selected
+   one. A selection started on channel B finishes on channel B however
+   many times the firmware has flipped SELBUSB since. */
+static void
+aic_ch_sstat0(aic7xxx_t *dev, uint8_t ch, uint8_t set, uint8_t clr)
+{
+    if (ch == dev->cell_live) {
+        dev->sstat0 = (uint8_t) ((dev->sstat0 & ~clr) | set);
+        aic_scsi_int(dev);
+    } else
+        dev->cell_save[ch].sstat0 = (uint8_t) ((dev->cell_save[ch].sstat0 & ~clr) | set);
+}
+
+static void
+aic_ch_sstat1(aic7xxx_t *dev, uint8_t ch, uint8_t set, uint8_t clr)
+{
+    if (ch == dev->cell_live) {
+        dev->sstat1 = (uint8_t) ((dev->sstat1 & ~clr) | set);
+        aic_scsi_int(dev);
+    } else
+        dev->cell_save[ch].sstat1 = (uint8_t) ((dev->cell_save[ch].sstat1 & ~clr) | set);
+}
+
+/* What a channel's SCSISEQ says, wherever it is kept. */
+static uint8_t
+aic_ch_scsiseq(const aic7xxx_t *dev, uint8_t ch)
+{
+    return (ch == dev->cell_live) ? dev->scsiseq : dev->cell_save[ch].scsiseq;
+}
+
+static uint8_t
+aic_ch_sxfrctl1(const aic7xxx_t *dev, uint8_t ch)
+{
+    return (ch == dev->cell_live) ? dev->sxfrctl1 : dev->cell_save[ch].sxfrctl1;
+}
+
+/* Our own and the target's identifier, which is per channel like the rest
+   of the cell -- the firmware writes it on the channel it is about to
+   select on, and may have switched the file away before the selection
+   finishes. Reading the live copy then selected whoever the other channel
+   happened to be pointed at. */
+static uint8_t
+aic_ch_scsiid(const aic7xxx_t *dev, uint8_t ch)
+{
+    return (ch == dev->cell_live) ? dev->scsiid : dev->cell_save[ch].scsiid;
+}
+
+static void
+aic_ch_selid(aic7xxx_t *dev, uint8_t ch, uint8_t val)
+{
+    if (ch == dev->cell_live)
+        dev->selid = val;
+    else
+        dev->cell_save[ch].selid = val;
+}
+
 static void
 aic_set_sstat0(aic7xxx_t *dev, uint8_t bits)
 {
@@ -988,7 +1172,11 @@ static void
 aic_bus_changed(aic7xxx_t *dev)
 {
     uint8_t phase;
-    uint8_t req = (dev->bus_state == BUS_BUSY) && dev->tgt_req;
+    /* Only from the channel it is on. The other cell has its own REQ and
+       its own phase, and while the file is switched away from this
+       connection none of it is readable. */
+    uint8_t req = (dev->bus_state == BUS_BUSY) && dev->tgt_req &&
+                  (dev->cur_ch == dev->cell_live);
 
     /* REQINIT goes up on the leading edge of REQ and comes down with the
        ACK that answers it, or when CLRREQINIT says so: cleared by hand it
@@ -1047,6 +1235,7 @@ aic_bus_free(aic7xxx_t *dev)
     dev->msgin_len = dev->msgin_pos = 0;
     dev->msgout_len                 = 0;
     timer_stop(&dev->tgt_timer);
+    timer_stop(&dev->req_timer);
     aic_set_sstat1(dev, BUSFREE);
     aic_bus_changed(dev);
 }
@@ -1180,6 +1369,21 @@ aic_tgt_schedule(aic7xxx_t *dev)
    works on a bus that answers instantly and nowhere else. */
 #define AIC_REQ_INSNS 2
 
+/* And how long a target takes between message bytes, which is a different
+   thing. Data streams through a drive's SCSI engine; message bytes go up
+   to its firmware one at a time and come back microseconds later. The
+   AHA-2740's option ROM is written for that. When its sequencer hands an
+   extended message to the host (INTCODE 7), the interrupt handler releases
+   the sequencer before the host has read anything, and the host then peeks
+   the opcode off the lines while the sequencer -- which has acknowledged it
+   and gone to wait for the next REQ -- has nothing yet to see. That only
+   works because the drive is slower than the host's next I/O cycle, and a
+   turnaround of two sequencer instructions made the model faster than any
+   host could be. This is a property of drives, not of the chip, and the
+   data book is silent on it; the number is a typical one, not a measured
+   one, and is the only thing in this file that is. */
+#define AIC_MSG_TURNAROUND_US 5.0
+
 /* And how many pass between HDMAEN going up and the host side's first
    bytes. A program that reads DFDAT without waiting for HDONE reads what
    has not arrived. */
@@ -1203,8 +1407,31 @@ aic_tgt_req_again(aic7xxx_t *dev)
         aic_bus_changed(dev);
         return;
     }
-    dev->tgt_req  = 0;
+    /* What stays on the lines while REQ is down. */
+    if (dev->tgt_phase & IOI)
+        dev->tgt_held = aic_tgt_byte(dev);
+    dev->tgt_req = 0;
+    if (dev->tgt_phase == P_MESGIN) {
+        /* Real time, and not brought forward by a host access: the
+           host getting in ahead of this REQ is the point. */
+        dev->req_wait = 0;
+        aic_bus_changed(dev);
+        timer_on_auto(&dev->req_timer, AIC_MSG_TURNAROUND_US);
+        return;
+    }
     dev->req_wait = AIC_REQ_INSNS;
+    aic_bus_changed(dev);
+}
+
+/* The next message byte is up. */
+static void
+aic_tgt_req_timer(void *priv)
+{
+    aic7xxx_t *dev = (aic7xxx_t *) priv;
+
+    if ((dev->bus_state != BUS_BUSY) || (dev->tgt_phase != P_MESGIN))
+        return;
+    dev->tgt_req = 1;
     aic_bus_changed(dev);
 }
 
@@ -1513,6 +1740,8 @@ aic_tgt_acked(aic7xxx_t *dev)
 {
     aic_cmd_t *c = dev->cur;
 
+    dev->tgt_held = aic_tgt_byte(dev);
+
     switch (dev->tgt_phase) {
         case P_MESGIN:
             dev->msgin_pos++;
@@ -1568,6 +1797,9 @@ aic_select_start(aic7xxx_t *dev)
     if (dev->selecting || (dev->bus_state != BUS_FREE))
         return;
     dev->selecting = 1;
+    /* And it stays that channel's until it finishes, however many times
+       the firmware flips SELBUSB while it is running. */
+    dev->sel_ch = dev->cell_live;
     dev->sstat0 |= SELINGO;
     /* The timer is nominal: the firmware only cares that a present
        target is quick and an absent one is not. */
@@ -1583,21 +1815,23 @@ aic_select_done(void *priv)
     aic_cmd_t     *c;
 
     if (!dev->selecting) {
-        dev->sstat0 &= ~SELINGO;
+        aic_ch_sstat0(dev, dev->sel_ch, 0, SELINGO);
         return;
     }
 
     /* TID is four bits wide whatever the bus is. On a narrow one the top
        half of the addresses is not aliased down onto the bottom half --
        there is simply nothing there, and selecting it runs out. */
-    id = (dev->scsiid >> 4) & 0x0f;
-    sd = (!dev->wide && (id > 7)) ? NULL : &scsi_devices[aic_cur_bus(dev)][id];
+    id = (aic_ch_scsiid(dev, dev->sel_ch) >> 4) & 0x0f;
+    sd = (!dev->wide && (id > 7)) ? NULL
+                                  : &scsi_devices[aic_bus_of_ch(dev, dev->sel_ch)][id];
 
     /* Nobody there, and the selection timer not running: the chip goes on
        selecting for ever. CHIPRST leaves ENSTIMER clear, so a driver that
        resets the part and does not put SXFRCTL1 back never sees SELTO. */
-    if ((dev->scsiseq & ENSELO) && ((sd == NULL) || !scsi_device_present(sd)) &&
-        !(dev->sxfrctl1 & ENSTIMER)) {
+    if ((aic_ch_scsiseq(dev, dev->sel_ch) & ENSELO) &&
+        ((sd == NULL) || !scsi_device_present(sd)) &&
+        !(aic_ch_sxfrctl1(dev, dev->sel_ch) & ENSTIMER)) {
         aic_log(dev->tag, "select %i: nobody, and no selection timer\n", id);
         /* Leaving the selection running is not the same as leaving the
            timer half armed. timer_on_auto() resumes from the previous
@@ -1610,17 +1844,18 @@ aic_select_done(void *priv)
         return;
     }
 
-    dev->sstat0 &= ~SELINGO;
+    aic_ch_sstat0(dev, dev->sel_ch, 0, SELINGO);
     dev->selecting = 0;
 
-    if (!(dev->scsiseq & ENSELO)) {
+    if (!(aic_ch_scsiseq(dev, dev->sel_ch) & ENSELO)) {
         aic_bus_changed(dev);
         return;
     }
 
     if ((sd == NULL) || !scsi_device_present(sd)) {
-        aic_log(dev->tag, "select %i: timeout\n", id);
-        aic_set_sstat1(dev, SELTO);
+        aic_log(dev->tag, "select %i: timeout on channel %c\n", id,
+                dev->sel_ch ? 'B' : 'A');
+        aic_ch_sstat1(dev, dev->sel_ch, SELTO, 0);
         aic_bus_changed(dev);
         return;
     }
@@ -1628,16 +1863,17 @@ aic_select_done(void *priv)
     c = aic_cmd_alloc(dev);
     if (c == NULL) {
         dev->scsiseq &= ~ENSELO;
-        aic_set_sstat1(dev, SELTO);
+        aic_ch_sstat1(dev, dev->sel_ch, SELTO, 0);
         aic_bus_changed(dev);
         return;
     }
     c->id  = id;
-    c->bus = aic_cur_bus(dev);
+    c->bus = aic_bus_of_ch(dev, dev->sel_ch);
 
+    dev->cur_ch    = dev->sel_ch;
     dev->cur       = c;
     dev->bus_state = BUS_BUSY;
-    dev->selid     = (uint8_t) (id << 4);
+    aic_ch_selid(dev, dev->cur_ch, (uint8_t) (id << 4));
     /* ATN is not driven through SCSISIGO for this: the chip raises it
        itself on a successful select-out when told to, which is how the
        firmware gets a message out phase for its identify message. */
@@ -1672,7 +1908,6 @@ aic_reselect_try(aic7xxx_t *dev)
     c->waited      = 0;
     dev->cur       = c;
     dev->bus_state = BUS_BUSY;
-    dev->selid     = (uint8_t) (c->id << 4);
     if (dev->scsiseq & ENAUTOATNI)
         dev->atn = 1;
 
@@ -1694,11 +1929,16 @@ aic_reselect_try(aic7xxx_t *dev)
        board wired for one the answer is always channel A, and saying so
        is what lets a single-channel card finish a reselection at all. */
     if (dev->chip->sblkctl_mask & SELBUSB) {
-        if (dev->twin && (c->bus == dev->bus_b))
+        uint8_t ch = aic_ch_of_bus(dev, c->bus);
+
+        if (ch)
             dev->sblkctl |= SELBUSB;
         else
             dev->sblkctl &= ~SELBUSB;
+        aic_cell_swap(dev, ch);
     }
+    dev->cur_ch = aic_ch_of_bus(dev, c->bus);
+    aic_ch_selid(dev, dev->cur_ch, (uint8_t) (c->id << 4));
 
     aic_log(dev->tag, "[%.3f ms] reselect %i lun %i tag %02x on channel %c\n",
             aic_now_us() / 1000.0, c->id, c->lun, c->tagged ? c->tag : 0xff,
@@ -1738,6 +1978,7 @@ aic_scsi_reset_bus(aic7xxx_t *dev)
     dev->sstat0 &= ~(SELDO | SELDI | SELINGO);
     timer_stop(&dev->sel_timer);
     timer_stop(&dev->tgt_timer);
+    timer_stop(&dev->req_timer);
 
     for (uint8_t i = 0; i < (dev->wide ? 16 : 8); i++)
         scsi_device_reset(&scsi_devices[aic_cur_bus(dev)][i]);
@@ -2120,11 +2361,30 @@ aic_read(aic7xxx_t *dev, uint8_t addr, int seq)
                it; this is how the firmware takes a PIO byte. */
             if ((dev->bus_state == BUS_BUSY) && dev->tgt_req && (dev->tgt_phase & IOI)) {
                 ret = aic_tgt_byte(dev);
-                /* Without SPIOEN the read is only a look at the latch. */
-                if (dev->sxfrctl0 & SPIOEN) {
-                    aic_pio_counted(dev);
-                    aic_tgt_acked(dev);
+                if (dev->busl_reads < 64) {
+                    dev->busl_reads++;
+                    aic_log(dev->tag, "%s reads SCSIDATL = %02x (phase %s, msgin %u/%u, "
+                            "spioen %u -> %s)\n", seq ? "seq" : "host", ret,
+                            aic_phase_name(dev->tgt_phase), dev->msgin_pos, dev->msgin_len,
+                            !!(dev->sxfrctl0 & SPIOEN), "acked");
                 }
+                /* The read is the handshake, automatic PIO or not. The
+                   register's own description: a latch "used to transfer
+                   data on the SCSI bus during Automatic or Manual SCSI
+                   PIO transfer. The SCSI ACK (as Initiator) or REQ (as
+                   Target) is driven active when the write or read
+                   occurs." SPIOEN adds SPIORDY and the automatic re-REQ
+                   on top -- "may be left on during Normal transfers
+                   without adverse effect" -- it is not what makes the
+                   ACK. Gating the ACK on it left a byte standing whenever
+                   the firmware read with it off, and a target with a byte
+                   still unacknowledged never moves. The count, though,
+                   is automatic PIO's: STCNT counts ACKs the hardware
+                   sends for the sequencer, and a manual handshake is not
+                   one of those. */
+                if (dev->sxfrctl0 & SPIOEN)
+                    aic_pio_counted(dev);
+                aic_tgt_acked(dev);
             } else
                 ret = dev->scsidatl;
             return ret;
@@ -2180,9 +2440,40 @@ aic_read(aic7xxx_t *dev, uint8_t addr, int seq)
         case SIMODE1:
             return dev->simode1;
         case SCSIBUSL:
-            /* The data lines, read without acknowledging. */
-            if ((dev->bus_state == BUS_BUSY) && dev->tgt_req)
-                return aic_tgt_byte(dev);
+            /* The data lines, read without acknowledging, and only from
+               the channel the connection is on: the other cell has its
+               own bus and its own byte on it. */
+            /* "This register reads data on the SCSI Data bus directly.
+               Data is gated from the SCSI Data bus to the internal Data
+               bus, it is not latched in the SCSI module." Nothing about
+               REQ: between two handshakes of an IN phase the target is
+               still driving the lines, with the byte it last offered
+               until it puts the next one up. The AHA-2740's option ROM
+               reads exactly that -- its extended message handler peeks
+               the opcode here during the turnaround after the sequencer
+               has acknowledged it -- and answering zero while REQ was
+               down gave it nothing to classify. */
+            if ((dev->bus_state == BUS_BUSY) && (dev->tgt_phase & IOI) &&
+                (dev->cur_ch == dev->cell_live)) {
+                uint8_t b = dev->tgt_req ? aic_tgt_byte(dev) : dev->tgt_held;
+
+                if (dev->busl_reads < 64) {
+                    dev->busl_reads++;
+                    aic_log(dev->tag, "%s reads SCSIBUSL = %02x (phase %s, "
+                            "msgin %u/%u)\n", seq ? "seq" : "host", b,
+                            aic_phase_name(dev->tgt_phase), dev->msgin_pos,
+                            dev->msgin_len);
+                }
+                return b;
+            }
+            if (dev->busl_reads < 64) {
+                dev->busl_reads++;
+                aic_log(dev->tag, "%s reads SCSIBUSL = 00 (no byte: state %u "
+                        "req %u cur_ch %u live %u phase %s)\n",
+                        seq ? "seq" : "host", dev->bus_state, dev->tgt_req,
+                        dev->cur_ch, dev->cell_live,
+                        aic_phase_name(dev->tgt_phase));
+            }
             return 0;
         case SCSIBUSH:
             return 0;
@@ -2755,6 +3046,7 @@ aic_write(aic7xxx_t *dev, uint8_t addr, uint8_t val, int seq)
                     forced |= SELBUSB;
 
                 dev->sblkctl = val & dev->chip->sblkctl_mask & ~forced;
+                aic_cell_swap(dev, (dev->sblkctl & SELBUSB) ? 1 : 0);
             }
             break;
         case SCSITEST:
@@ -3665,6 +3957,7 @@ aic_chip_reset(aic7xxx_t *dev)
     timer_stop(&dev->seq_timer);
     timer_stop(&dev->sel_timer);
     timer_stop(&dev->tgt_timer);
+    timer_stop(&dev->req_timer);
 
     for (uint8_t i = 0; i < AIC_CMDS; i++) {
         if (dev->cmds[i].used)
@@ -3690,8 +3983,18 @@ aic_chip_reset(aic7xxx_t *dev)
     /* A reset value is not a write mask: the mask says which bits the part
        has, this says what they come up holding. Deriving one from the
        other set AUTOFLUSHDIS on a part whose reset clears it. */
-    dev->sblkctl = dev->chip->sblkctl_reset |
-                   (dev->twin ? SELBUSB : 0) | (dev->wide ? SELWIDE : 0);
+    /* The strap table's rows are DualBusses 08h, Channel A only 00h and
+       Wide 02h. An AHA-2742A is one narrow connector, so it comes up on
+       channel A -- SELBUSB clear -- even though the part behind it has a
+       channel B for the firmware to go looking at. A board with two
+       connectors would come up 08h, and that belongs to the board rather
+       than to the chip. */
+    dev->sblkctl = dev->chip->sblkctl_reset | (dev->wide ? SELWIDE : 0);
+    /* Both cells come up empty, and the file starts on whichever channel
+       the straps named. */
+    memset(dev->cell_save, 0, sizeof(dev->cell_save));
+    dev->cell_live = (dev->sblkctl & SELBUSB) ? 1 : 0;
+    dev->sel_ch = dev->cur_ch = dev->cell_live;
     dev->scsitest   = 0;
     dev->sleepctl   = 0;
     dev->must_step  = 0;
@@ -3866,7 +4169,7 @@ aic_eisa_bios_overlay(aic7xxx_t *dev)
     if (!dev->has_bios || (dev->rom_size < 0x4000))
         return;
 
-    memcpy(&dev->bios.rom[AIC_BIOS_RAMOFF],
+    memcpy(&dev->bios.rom[aic_bios_ramoff(dev)],
            (dev->eisa_conf[HA_274_BIOSCTRL - SCSICONF] & AIC_BIOS_RAMEN)
                ? dev->bios_ram
                : dev->bios_rom_top,
@@ -3902,11 +4205,26 @@ aic_eisa_rom_write(uint32_t addr, uint8_t val, void *priv)
     uint32_t   off = (addr - dev->bios.mapping.base) & (dev->rom_size - 1);
     uint8_t    ctl = dev->eisa_conf[HA_274_BIOSCTRL - SCSICONF];
 
-    if ((off < AIC_BIOS_RAMOFF) || (off >= (AIC_BIOS_RAMOFF + AIC_BIOS_RAMSIZE)) ||
+    /* Where the firmware thinks its overlay is. It writes a pattern and
+       reads it back before it will install itself, so a window that
+       answers at the wrong offset fails that test and says so. Bounded:
+       the test is a few hundred bytes, a stray scan is not. */
+    if (dev->rom_writes < 64) {
+        dev->rom_writes++;
+        aic_log(dev->tag, "option ROM write +%04x = %02x (overlay +%04x..%04x, "
+                "biosctrl %02x, %s)\n", off, val, aic_bios_ramoff(dev),
+                aic_bios_ramoff(dev) + AIC_BIOS_RAMSIZE - 1, ctl,
+                ((off >= aic_bios_ramoff(dev)) &&
+                 (off < (aic_bios_ramoff(dev) + AIC_BIOS_RAMSIZE)) &&
+                 !(ctl & AIC_BIOS_WRTPRT)) ? "taken" : "DROPPED");
+    }
+
+    if ((off < aic_bios_ramoff(dev)) ||
+        (off >= (aic_bios_ramoff(dev) + AIC_BIOS_RAMSIZE)) ||
         (ctl & AIC_BIOS_WRTPRT))
         return;
 
-    dev->bios_ram[off - AIC_BIOS_RAMOFF] = val;
+    dev->bios_ram[off - aic_bios_ramoff(dev)] = val;
     if (ctl & AIC_BIOS_RAMEN)
         dev->bios.rom[off] = val;
 }
@@ -4009,7 +4327,7 @@ aic_eisa_bios(aic7xxx_t *dev, const device_t *info)
     mem_mapping_set_p(&dev->bios.mapping, dev);
 
     if (size >= 0x4000)
-        memcpy(dev->bios_rom_top, &dev->bios.rom[AIC_BIOS_RAMOFF],
+        memcpy(dev->bios_rom_top, &dev->bios.rom[aic_bios_ramoff(dev)],
                AIC_BIOS_RAMSIZE);
 
     aic_log(dev->tag, "option ROM %s, %u KB\n", fn, size >> 10);
@@ -4319,6 +4637,8 @@ aic_pci_write(int func, int addr, UNUSED(int len), uint8_t val, void *priv)
 #define AHA2940UW_V134_ROM "roms/scsi/adaptec/aha2940uw_v134.bin"
 #define AHA2940UW_V220_ROM "roms/scsi/adaptec/aha2940uw_v220.bin"
 #define AHA2740_V210_ROM   "roms/scsi/adaptec/aha2740_v210.bin"
+#define AHA2740W_V211_ROM  "roms/scsi/adaptec/aha2740w.bin"
+#define AHA2742A_V211_ROM  "roms/scsi/adaptec/aha2742a.bin"
 
 
 static void
@@ -4357,20 +4677,12 @@ aic_init(const device_t *info)
        channel B, and on a card with one connector the answer is nothing
        and the selection times out.
 
-       Giving it one here does not work yet, and the reason is the register
-       file. "Device addresses 00h-1Eh reflect the Channel B registers",
-       both channels "mapped to the same I/O space", and this model has one
-       copy of that block. With the bit free to move, the firmware's poll
-       loop -- which flips SELBUSB on every pass -- reads channel A's
-       status while it believes it is looking at B, and the SCB search it
-       then runs finds no match and reports INTCODE 8. Measured: one
-       channel and the bit forced, 0 of those in a POST; two channels and
-       one register file, 171.
-
-       So it stays at one channel until that block is per channel, which
-       is the next piece of work and not a patch. What it costs is the
-       last command the ROM queues, and with it the install. */
-    dev->twin  = 0;
+       So channel B exists here and is simply empty, which is what makes
+       that last command answerable: the selection goes out on a bus with
+       nothing on it and times out, on channel B's own SSTAT1, and the ROM
+       carries on. That needs the register file to be per channel, which
+       aic_cell_t and aic_cell_swap() now make it. */
+    dev->twin  = (dev->board == BOARD_2740);
 
     dev->eisa  = (dev->board == BOARD_2740);
     /* Which part this board is built on, before anything asks. */
@@ -4490,8 +4802,9 @@ aic_init(const device_t *info)
            other half of saying so. A board that really is wired for two
            gets its second SCSICONF from the configuration utility, which
            is where a twin member of the family will pick it up. */
-        if (dev->twin)
-            dev->eisa_conf[SCSICONF_B - SCSICONF] = TERM_ENB | ENSPCHK | 7;
+        /* And no second connector to describe. The utility writes a
+           SCSICONF per channel on a board that has two; this one has one,
+           so channel B's stays as an unconfigured channel reads. */
 
         dev->eisa_global  = 0x00;
         dev->bios_ctl_set = 0;
@@ -4568,6 +4881,7 @@ aic_init(const device_t *info)
     timer_add(&dev->seq_timer, aic_seq_timer, dev, 0);
     timer_add(&dev->sel_timer, aic_select_done, dev, 0);
     timer_add(&dev->tgt_timer, aic_tgt_timer, dev, 0);
+    timer_add(&dev->req_timer, aic_tgt_req_timer, dev, 0);
 
     aic_chip_reset(dev);
 
@@ -4614,7 +4928,7 @@ static const device_config_t aic7770_config[] = {
         .name           = "bios_rev",
         .description    = "BIOS Revision",
         .type           = CONFIG_BIOS,
-        .default_string = "v2_10",
+        .default_string = "v2_11_edd",
         .default_int    = 0,
         .file_filter    = NULL,
         .spinner        = { 0 },
@@ -4627,6 +4941,24 @@ static const device_config_t aic7770_config[] = {
                 .local         = 0,
                 .size          = 16384,
                 .files         = { AHA2740_V210_ROM, "" }
+            },
+            {
+                .name          = "Version 2.11 EDD 1.1",
+                .internal_name = "v2_11_edd",
+                .bios_type     = BIOS_NORMAL,
+                .files_no      = 1,
+                .local         = 0,
+                .size          = 32768,
+                .files         = { AHA2742A_V211_ROM, "" }
+            },
+            {
+                .name          = "Version 2.11 EDD 1.1 (2740W dump)",
+                .internal_name = "v2_11_edd_w",
+                .bios_type     = BIOS_NORMAL,
+                .files_no      = 1,
+                .local         = 0,
+                .size          = 32768,
+                .files         = { AHA2740W_V211_ROM, "" }
             },
             { .files_no = 0 }
         }
