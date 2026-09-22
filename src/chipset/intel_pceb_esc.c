@@ -831,9 +831,14 @@ static void    esc_write(uint16_t port, uint8_t val, void *priv);
 
      - it clears the bit. MS is written as (old & 80h) | 4Ch, at
        F000:E810 and F000:EA6C, and those are the only two writes to it
-       in the image -- the configuration registers are reached through
-       one pair of helpers at F000:EA2B and F000:EA32, every near call
-       and jump to them is accounted for, and there are no far ones;
+       in the boot block -- the configuration registers are reached
+       through one pair of helpers at F000:EA2B and F000:EA32, and every
+       near call and jump to them in the F000 segment is accounted for.
+       Only that segment can be read this way: the E000 half is
+       compressed AMI modules, so a runtime module that touches these
+       registers does not appear in that enumeration at all, and an
+       earlier note here that called it exhaustive over the whole image
+       was claiming more than the image gives up;
      - and it then uses all thirty-two pages, which a POST sweep walks
        end to end;
      - over a store whose own block length is 1FB0h and whose checksum
@@ -862,6 +867,11 @@ esc_cram_decode(esc_t *dev)
     uint8_t cram = !!(dev->regs[0x4f] & 0x80);
     uint8_t p92  = !!(dev->regs[0x4f] & 0x40);
 
+    esc_log("ESC: [%04X:%08X] PCSB %02X -> cram %u (was %u), port 92 %u "
+            "(was %u), page %02X\n", CS, cpu_state.pc, dev->regs[0x4f],
+            cram, dev->cram_decoded, p92, dev->port_92_decoded,
+            dev->cram_page);
+
     if (p92 != dev->port_92_decoded) {
         dev->port_92_decoded = p92;
         if (dev->port_92 != NULL) {
@@ -876,30 +886,44 @@ esc_cram_decode(esc_t *dev)
        the part behind them: "This bit is used to enable (1) or disable
        (0) I/O write accesses to location 0C00h and I/O read/write
        accesses to locations 0800h - 08FFh." Bit 6 just below it is
-       worded the same way for Port 92 and is acted on the same way, so
-       this one is too.
+       worded the same way for Port 92, and Port 92 really is this
+       part's, so that one is acted on.
 
-       Note which accesses that sentence covers. The window goes away in
-       both directions, but of the page register only writes go with it,
-       so CONFRAMP still reads back while the bit is clear.
+       This one is not, for the same reason Mode Select bit 5 above it is
+       not. Something in this machine takes the bit away during POST, and
+       the firmware then reads and checksums the whole eight kilobytes of
+       the store through 0800h-08FFh afterwards -- the same thing it does
+       after clearing the page address. A window that had really gone
+       away could not answer that. So on this board 0800h-08FFh and 0C00h
+       are the board's own, decoded and latched beside the ESC rather
+       than by it, and clearing this bit is how the part is told to stop
+       answering for something it does not own.
 
-       This board never exercises it. Its BIOS reaches the configuration
-       registers through one pair of helpers -- read at F000:EA2B, write
-       at F000:EA32 -- and the only indices it ever hands them are 40h,
-       42h, 43h and 4Eh. PCSB is not among them, so the register keeps
-       its CFh default and the bit stays set for the life of the
-       machine. */
+       Acting on it is what an earlier pass here did, and the machine
+       came up saying "EISA NVRAM Bad" with a perfectly good store behind
+       a window nothing could reach. The bit is tracked and reported --
+       which is what the trace above is for, since what writes it is not
+       visible in the plain half of the image -- and the window stays. */
     if (cram != dev->cram_decoded) {
         dev->cram_decoded = cram;
-        esc_log("ESC: configuration RAM %s\n", cram ? "decoded" : "not decoded");
-        io_handler(cram, 0x0800, 0x0100, esc_read, NULL, NULL,
-                   esc_write, NULL, NULL, dev);
+        esc_log("ESC: PCSB says the configuration RAM is %s; the board "
+                "decodes it either way\n", cram ? "decoded" : "not decoded");
     }
 }
 
 static void
 esc_conf_write(esc_t *dev, uint8_t index, uint8_t val)
 {
+    /* Every write, with the address that made it. Which of the several
+       things in this machine reaches a given configuration register is
+       not answerable from the ROM -- the E000 half is compressed, so a
+       runtime module, an option ROM and the configuration utility are
+       all invisible until they run -- and it is the question whenever a
+       decode changes without the boot block having asked. */
+    esc_log("ESC: [%04X:%08X] conf wr %02X = %02X (was %02X)%s\n",
+            CS, cpu_state.pc, index, val, dev->regs[index],
+            (!dev->unlocked && (index != 0x02)) ? " DROPPED, locked" : "");
+
     /* Until the ID register has been given 0Fh the part is deaf to
        everything else. */
     if (!dev->unlocked && (index != 0x02))
@@ -963,6 +987,9 @@ esc_conf_write(esc_t *dev, uint8_t index, uint8_t val)
                north bridge's, as it is for every other machine of this
                generation. */
             dev->regs[index] = val;
+            esc_log("ESC: BIOSCS%c %02X, BIOS writes %s\n",
+                    (index == 0x42) ? 'A' : 'B', val,
+                    (dev->regs[0x43] & 0x08) ? "enabled" : "disabled");
             break;
 
         case 0x4d: /* CLKDIV */
@@ -1093,8 +1120,21 @@ esc_conf_write(esc_t *dev, uint8_t index, uint8_t val)
     }
 }
 
+static uint8_t esc_conf_read_reg(esc_t *dev, uint8_t index);
+
 static uint8_t
 esc_conf_read(esc_t *dev, uint8_t index)
+{
+    uint8_t ret = esc_conf_read_reg(dev, index);
+
+    esc_log("ESC: [%04X:%08X] conf rd %02X = %02X%s\n", CS, cpu_state.pc,
+            index, ret, dev->unlocked ? "" : " (locked)");
+
+    return ret;
+}
+
+static uint8_t
+esc_conf_read_reg(esc_t *dev, uint8_t index)
 {
     if (!dev->unlocked && (index != 0x02))
         return 0x00;
@@ -1211,15 +1251,18 @@ esc_write(uint16_t port, uint8_t val, void *priv)
             break;
 
         case 0x0c00: /* CONFRAMP, which page of the configuration RAM */
-            /* The other half of what PCSB bit 7 takes away: writes here
-               go with the window, reads do not. */
-            if (dev->cram_decoded)
-                dev->cram_page = val & 0x1f;
+            /* Latched beside the ESC rather than by it -- see
+               esc_cram_decode -- so PCSB bit 7 does not take it away.
+               Reported with the bit's state so a trace says both. */
+            esc_log("ESC: [%04X:%08X] CONFRAMP = %02X (PCSB %02X, MS %02X)\n",
+                    CS, cpu_state.pc, val & 0x1f, dev->regs[0x4f],
+                    dev->regs[0x40]);
+            dev->cram_page = val & 0x1f;
             break;
 
         case 0x0800 ... 0x08ff: /* the configuration RAM itself */
-            esc_log("ESC: cram wr %02x:%02x = %02x\n", esc_cram_page(dev),
-                    port & 0xff, val);
+            esc_log("ESC: [%04X:%08X] cram wr %02x:%02x = %02x\n", CS,
+                    cpu_state.pc, esc_cram_page(dev), port & 0xff, val);
             dev->cram[(esc_cram_page(dev) * 256) + (port & 0xff)] = val;
             break;
 
@@ -1249,11 +1292,13 @@ esc_read(uint16_t port, void *priv)
             return dev->nmi_esc;
 
         case 0x0c00:
+            esc_log("ESC: [%04X:%08X] CONFRAMP read %02X\n", CS,
+                    cpu_state.pc, dev->cram_page);
             return dev->cram_page;
 
         case 0x0800 ... 0x08ff:
-            esc_log("ESC: cram rd %02x:%02x = %02x\n", esc_cram_page(dev),
-                    port & 0xff,
+            esc_log("ESC: [%04X:%08X] cram rd %02x:%02x = %02x\n", CS,
+                    cpu_state.pc, esc_cram_page(dev), port & 0xff,
                     dev->cram[(esc_cram_page(dev) * 256) + (port & 0xff)]);
             return dev->cram[(esc_cram_page(dev) * 256) + (port & 0xff)];
 
@@ -1270,8 +1315,8 @@ esc_read(uint16_t port, void *priv)
                POST, and an operating system deciding whether there is an
                EISA bus here at all. Worth seeing, since the answer used
                to be nothing. */
-            esc_log("ESC: board id %d = %02x\n", port & 3,
-                    dev->board_id[port & 3]);
+            esc_log("ESC: [%04X:%08X] board id %d = %02x\n", CS,
+                    cpu_state.pc, port & 3, dev->board_id[port & 3]);
             return dev->board_id[port & 3];
 
         default:
@@ -1341,6 +1386,12 @@ esc_reset_hard(esc_t *dev)
     dma_set_sg_base(0x04);
 
     esc_pirq_update(dev);
+
+    esc_log("ESC: hard reset, MS %02X PCSB %02X BIOSCSA %02X BIOSCSB %02X "
+            "PCSA %02X, board %02X %02X %02X %02X\n", dev->regs[0x40],
+            dev->regs[0x4f], dev->regs[0x42], dev->regs[0x43],
+            dev->regs[0x4e], dev->board_id[0], dev->board_id[1],
+            dev->board_id[2], dev->board_id[3]);
 
     esc_cram_decode(dev);
 
