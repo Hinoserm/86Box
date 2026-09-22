@@ -2748,7 +2748,7 @@ aic_write(aic7xxx_t *dev, uint8_t addr, uint8_t val, int seq)
                 uint8_t forced = 0;
 
                 if (!dev->twin)
-                    forced |= SELBUSB;
+                    forced |= SELBUSB;   /* no channel B to switch to */
                 if (!dev->wide)
                     forced |= SELWIDE;
                 if (val & SELWIDE)
@@ -3074,7 +3074,20 @@ aic_write(aic7xxx_t *dev, uint8_t addr, uint8_t val, int seq)
             dev->scbcnt = val & (SCBAUTO | 0x1f);
             break;
         case QINFIFO:
-            /* The host queues an SCB for the sequencer. */
+            /* The host queues an SCB for the sequencer. Which SCB, and
+               what is in the two bytes the firmware dispatches on --
+               SCB_CONTROL, and SCB_TCL with the channel in bit 3 -- is
+               the difference between a command that can run and one the
+               firmware will hand back for ever. */
+            if (!seq) {
+                const uint8_t *scb = dev->scb[val & (dev->chip->scb_pages - 1)];
+
+                aic_log(dev->tag, "host: queue scb%u ctl %02x tcl %02x "
+                        "(id %u ch %c lun %u), sblkctl %02x qincnt %u\n",
+                        val & (dev->chip->scb_pages - 1), scb[0x00], scb[0x01],
+                        (scb[0x01] >> 4) & 0x0f, (scb[0x01] & 0x08) ? 'B' : 'A',
+                        scb[0x01] & 0x07, dev->sblkctl, dev->qin_cnt);
+            }
             /* "Writes when QINCNT=4 ... are ignored." */
             if (dev->qin_cnt < dev->chip->q_depth) {
                 dev->qin[(dev->qin_rd + dev->qin_cnt) % dev->chip->q_depth] = val & (dev->chip->scb_pages - 1);
@@ -4335,14 +4348,28 @@ aic_init(const device_t *info)
        "DualBusses", 02h for one wide channel and 00h for a single narrow
        one, and the configuration utility writes a SCSICONF for each
        channel, so a board whose CFG declares both is wired for both. */
-    /* One connector. The strap table gives SBLKCTL 00h for a single narrow
-       channel, 02h for one wide one and 08h for two, and what it holds out
-       of reset is what tells the firmware which of those it is wired to.
-       Strapping this card for two put the chip on channel B before anything
-       had run, and the firmware never moved it back: every selection went
-       to a connector with nothing on it. The second bus below is kept for
-       the twin members of the family, which strap 08h and are told apart by
-       the board rather than by the chip. */
+    /* The AIC-7770 always has two channels -- "The AIC-7770 contains two
+       separate SCSI busses, SCSI Channel A and SCSI Channel B" -- and
+       this board's option ROM knows it. Having walked channel A from
+       address 0 to 6 it queues one more command with the channel bit set
+       in the SCB, every time, whatever the configuration says. It is not
+       asking whether there is a second connector; it is asking what is on
+       channel B, and on a card with one connector the answer is nothing
+       and the selection times out.
+
+       Giving it one here does not work yet, and the reason is the register
+       file. "Device addresses 00h-1Eh reflect the Channel B registers",
+       both channels "mapped to the same I/O space", and this model has one
+       copy of that block. With the bit free to move, the firmware's poll
+       loop -- which flips SELBUSB on every pass -- reads channel A's
+       status while it believes it is looking at B, and the SCB search it
+       then runs finds no match and reports INTCODE 8. Measured: one
+       channel and the bit forced, 0 of those in a POST; two channels and
+       one register file, 171.
+
+       So it stays at one channel until that block is per channel, which
+       is the next piece of work and not a patch. What it costs is the
+       last command the ROM queues, and with it the install. */
     dev->twin  = 0;
 
     dev->eisa  = (dev->board == BOARD_2740);
@@ -4445,8 +4472,27 @@ aic_init(const device_t *info)
            stored: identifier seven, terminators on, parity on. The bus
            reset bit stays clear, since nothing here reads it and asking
            for a reset that was never configured is worse than not. */
-        dev->eisa_conf[SCSICONF - SCSICONF]   = TERM_ENB | ENSPCHK | 7;
-        dev->eisa_conf[SCSICONF_B - SCSICONF] = TERM_ENB | ENSPCHK | 7;
+        dev->eisa_conf[SCSICONF - SCSICONF] = TERM_ENB | ENSPCHK | 7;
+
+        /* And channel B's stays at zero unless the board has a channel B.
+           An earlier pass here filled both in, which said there was a
+           second channel, terminated and parity checked, with an adapter
+           of its own at address seven. The option ROM believed it: it
+           walked channel A, got its inquiry and test unit ready answered,
+           and then asked once more with the channel bit set in the SCB
+           for the channel it had been told about. Nothing could run that
+           command, so it waited out its timeout and printed "Time-out
+           failure during SCSI Inquiry command!" and "BIOS not
+           installed!".
+
+           An AHA-2740 is one narrow channel. Its SBLKCTL straps say so --
+           00h, "Channel A only" in the reset table -- and this is the
+           other half of saying so. A board that really is wired for two
+           gets its second SCSICONF from the configuration utility, which
+           is where a twin member of the family will pick it up. */
+        if (dev->twin)
+            dev->eisa_conf[SCSICONF_B - SCSICONF] = TERM_ENB | ENSPCHK | 7;
+
         dev->eisa_global  = 0x00;
         dev->bios_ctl_set = 0;
         dev->irq          = 0;
