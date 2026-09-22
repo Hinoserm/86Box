@@ -1916,7 +1916,7 @@ aic_select_done(void *priv)
             dev->scb[dev->scbptr & (dev->chip->scb_pages - 1)][0x00],
             dev->scb[dev->scbptr & (dev->chip->scb_pages - 1)][0x01],
             dev->scb[dev->scbptr & (dev->chip->scb_pages - 1)][0x18]);
-    aic_set_sstat0(dev, SELDO);
+    aic_ch_sstat0(dev, dev->sel_ch, SELDO, 0);
     /* The target asks for the identify message, or for the command. */
     aic_tgt_next(dev);
 }
@@ -1975,7 +1975,7 @@ aic_reselect_try(aic7xxx_t *dev)
     aic_log(dev->tag, "[%.3f ms] reselect %i lun %i tag %02x on channel %c\n",
             aic_now_us() / 1000.0, c->id, c->lun, c->tagged ? c->tag : 0xff,
             (dev->sblkctl & SELBUSB) ? 'B' : 'A');
-    aic_set_sstat0(dev, SELDI);
+    aic_ch_sstat0(dev, dev->cur_ch, SELDI, 0);
 
     /* A reconnecting target identifies itself, and if the command was
        tagged, says which one it is. */
@@ -3993,6 +3993,7 @@ static void
 aic_chip_reset(aic7xxx_t *dev)
 {
     aic_log(dev->tag, "chip reset\n");
+    dev->busl_reads = dev->rom_writes = dev->hcntrl_logs = 0;
 
     timer_stop(&dev->seq_timer);
     timer_stop(&dev->sel_timer);
@@ -4722,7 +4723,16 @@ aic_init(const device_t *info)
        nothing on it and times out, on channel B's own SSTAT1, and the ROM
        carries on. That needs the register file to be per channel, which
        aic_cell_t and aic_cell_swap() now make it. */
-    dev->twin  = (dev->board == BOARD_2740);
+    dev->twin  = 0;
+    /* NOT a second connector, after all -- and the data book had it
+       right. The v2.11 option ROM decides the channel count at init by
+       reading SBLKCTL back and testing SELBUSB (x86 at 3636h): on a board
+       strapped Channel A only the bit is forced clear, it reads 00h, and
+       the ROM takes its single channel path and never asks after channel
+       B. Letting the bit move made the same ROM read 08h and walk a
+       channel it had never configured, with no selection timer on it.
+       The two cells are still modelled for a board that has both; what
+       decides is the strap, and this card's is one connector. */
 
     dev->eisa  = (dev->board == BOARD_2740);
     /* Which part this board is built on, before anything asks. */
