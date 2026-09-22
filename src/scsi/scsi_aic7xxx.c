@@ -584,6 +584,7 @@ typedef struct aic7xxx_t {
     uint32_t      busl_reads;
     uint32_t      sig_logs; /* host SCSISIGI reads and SBLKCTL writes traced */
     uint32_t      err_logs; /* hard errors traced */
+    uint32_t      scb_dumps; /* SCBs dumped at queue time */
     uint32_t      rom_size;
     uint8_t       bus;
     uint8_t       wide;
@@ -2073,6 +2074,11 @@ static void
 aic_scsi_reset_bus(aic7xxx_t *dev)
 {
     aic_log(dev->tag, "[%.3f ms] scsi bus reset\n", aic_now_us() / 1000.0);
+    /* A bus reset is where a driver starts over, and where the trace
+       should too: the bounded traces above were spent on the option
+       ROM's boot-time traffic before the driver ever loaded, and the
+       driver's own first command went unrecorded. */
+    dev->busl_reads = dev->sig_logs = dev->scb_dumps = 0;
     for (uint8_t i = 0; i < AIC_CMDS; i++) {
         if (dev->cmds[i].used)
             aic_cmd_free(dev, &dev->cmds[i]);
@@ -2404,11 +2410,21 @@ aic_pio_out(aic7xxx_t *dev)
 }
 
 static uint8_t
-aic_scb_offset(aic7xxx_t *dev, uint8_t addr)
+aic_scb_offset(aic7xxx_t *dev, uint8_t addr, int seq)
 {
     uint8_t off;
 
-    if (!(dev->scbcnt & SCBAUTO))
+    /* The auto-increment is the host's: "If SCBAUTO is set, then
+       SCBCNT(4:0) determines the address, and the SCB address is
+       automatically incremented on an I/O Read or Write" -- an I/O access,
+       through the SCB I/O address space. The sequencer reaches the array
+       over its own internal bus at A0h-BFh and names the byte it wants.
+       Applying the counter to it as well broke the first driver that
+       loads an SCB with a block write and leaves SCBAUTO set, as the
+       NT-style ones do: the firmware then read its command pointer from
+       wherever the counter had stopped -- the scatter/gather element --
+       and sent that to the target as the CDB. */
+    if (seq || !(dev->scbcnt & SCBAUTO))
         return (uint8_t) (addr - SCB_BASE);
 
     off         = dev->scbcnt & 0x1f;
@@ -2449,7 +2465,7 @@ aic_read(aic7xxx_t *dev, uint8_t addr, int seq)
         return dev->sram[addr - SRAM_BASE];
     if (addr >= SCB_BASE) {
         if (addr < (SCB_BASE + SCB_SIZE))
-            return dev->scb[dev->scbptr & (dev->chip->scb_pages - 1)][aic_scb_offset(dev, addr)];
+            return dev->scb[dev->scbptr & (dev->chip->scb_pages - 1)][aic_scb_offset(dev, addr, seq)];
         return dev->misc[addr - 0xc0];
     }
 
@@ -2510,7 +2526,7 @@ aic_read(aic7xxx_t *dev, uint8_t addr, int seq)
                it; this is how the firmware takes a PIO byte. */
             if ((dev->bus_state == BUS_BUSY) && dev->tgt_req && (dev->tgt_phase & IOI)) {
                 ret = aic_tgt_byte(dev);
-                if (dev->busl_reads < 64) {
+                if (dev->busl_reads < 512) {
                     dev->busl_reads++;
                     aic_log(dev->tag, "%s reads SCSIDATL = %02x (phase %s, msgin %u/%u, "
                             "spioen %u -> %s)\n", seq ? "seq" : "host", ret,
@@ -2610,7 +2626,7 @@ aic_read(aic7xxx_t *dev, uint8_t addr, int seq)
                 (dev->cur_ch == dev->cell_live)) {
                 uint8_t b = dev->tgt_req ? aic_tgt_byte(dev) : dev->tgt_held;
 
-                if (dev->busl_reads < 64) {
+                if (dev->busl_reads < 512) {
                     dev->busl_reads++;
                     aic_log(dev->tag, "%s reads SCSIBUSL = %02x (phase %s, "
                             "msgin %u/%u)\n", seq ? "seq" : "host", b,
@@ -2619,7 +2635,7 @@ aic_read(aic7xxx_t *dev, uint8_t addr, int seq)
                 }
                 return b;
             }
-            if (dev->busl_reads < 64) {
+            if (dev->busl_reads < 512) {
                 dev->busl_reads++;
                 aic_log(dev->tag, "%s reads SCSIBUSL = 00 (no byte: state %u "
                         "req %u cur_ch %u live %u phase %s)\n",
@@ -2946,7 +2962,7 @@ aic_write(aic7xxx_t *dev, uint8_t addr, uint8_t val, int seq)
     }
     if (addr >= SCB_BASE) {
         if (addr < (SCB_BASE + SCB_SIZE))
-            dev->scb[dev->scbptr & (dev->chip->scb_pages - 1)][aic_scb_offset(dev, addr)] = val;
+            dev->scb[dev->scbptr & (dev->chip->scb_pages - 1)][aic_scb_offset(dev, addr, seq)] = val;
         else
             dev->misc[addr - 0xc0] = val;
         return;
@@ -3549,6 +3565,21 @@ aic_write(aic7xxx_t *dev, uint8_t addr, uint8_t val, int seq)
                         val & (dev->chip->scb_pages - 1), scb[0x00], scb[0x01],
                         (scb[0x01] >> 4) & 0x0f, (scb[0x01] & 0x08) ? 'B' : 'A',
                         scb[0x01] & 0x07, dev->sblkctl, dev->qin_cnt);
+                /* And the whole block, the first few dozen times after a
+                   reset: what the firmware does with a command is decided
+                   by these bytes and nothing else, and a driver whose
+                   layout the model has never seen can only be read off
+                   them. */
+                if (dev->scb_dumps < 64) {
+                    dev->scb_dumps++;
+                    aic_log(dev->tag, "  scb%u: %02x %02x %02x %02x %02x %02x %02x %02x  %02x %02x %02x %02x %02x %02x %02x %02x  "
+                            "%02x %02x %02x %02x %02x %02x %02x %02x  %02x %02x %02x %02x %02x %02x %02x %02x\n",
+                            val & (dev->chip->scb_pages - 1),
+                            scb[0], scb[1], scb[2], scb[3], scb[4], scb[5], scb[6], scb[7],
+                            scb[8], scb[9], scb[10], scb[11], scb[12], scb[13], scb[14], scb[15],
+                            scb[16], scb[17], scb[18], scb[19], scb[20], scb[21], scb[22], scb[23],
+                            scb[24], scb[25], scb[26], scb[27], scb[28], scb[29], scb[30], scb[31]);
+                }
             }
             /* "Writes when QINCNT=4 ... are ignored." */
             if (dev->qin_cnt < dev->chip->q_depth) {
@@ -4122,7 +4153,7 @@ static void
 aic_chip_reset(aic7xxx_t *dev)
 {
     aic_log(dev->tag, "chip reset\n");
-    dev->busl_reads = dev->rom_writes = dev->hcntrl_logs = dev->sig_logs = dev->err_logs = 0;
+    dev->busl_reads = dev->rom_writes = dev->hcntrl_logs = dev->sig_logs = dev->err_logs = dev->scb_dumps = 0;
     dev->int_paused = 0;
 
     timer_stop(&dev->seq_timer);
