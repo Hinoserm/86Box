@@ -127,6 +127,61 @@ eisa_write(uint16_t port, uint8_t val, UNUSED(void *priv))
 /* The four windows a slot owns, claimed for every slot the board has so
    that an empty one reads 0xff rather than the bus's floating 0xff, which
    looks the same but is not guaranteed. */
+/* Word and dword cycles. A card that decodes them itself gets them whole;
+   otherwise they are the bytes in order, which is also what the four
+   identifier bytes are. */
+static uint16_t
+eisa_readw(uint16_t port, void *priv)
+{
+    uint8_t slot = EISA_SLOT_OF(port);
+
+    if ((slot <= eisa_nr_slots) && EISA_SLOT_SPECIFIC(port) && eisa_slots[slot].present &&
+        (eisa_slots[slot].readw != NULL) && (((port & 0x0fff) < EISA_ID_OFFSET) || ((port & 0x0fff) > (EISA_ID_OFFSET + 3))))
+        return eisa_slots[slot].readw(port, eisa_slots[slot].priv);
+
+    return (uint16_t) (eisa_read(port, priv) | (eisa_read((uint16_t) (port + 1), priv) << 8));
+}
+
+static uint32_t
+eisa_readl(uint16_t port, void *priv)
+{
+    uint8_t slot = EISA_SLOT_OF(port);
+
+    if ((slot <= eisa_nr_slots) && EISA_SLOT_SPECIFIC(port) && eisa_slots[slot].present &&
+        (eisa_slots[slot].readl != NULL) && (((port & 0x0fff) < EISA_ID_OFFSET) || ((port & 0x0fff) > (EISA_ID_OFFSET + 3))))
+        return eisa_slots[slot].readl(port, eisa_slots[slot].priv);
+
+    return (uint32_t) eisa_readw(port, priv) | ((uint32_t) eisa_readw((uint16_t) (port + 2), priv) << 16);
+}
+
+static void
+eisa_writew(uint16_t port, uint16_t val, void *priv)
+{
+    uint8_t slot = EISA_SLOT_OF(port);
+
+    if ((slot <= eisa_nr_slots) && EISA_SLOT_SPECIFIC(port) && eisa_slots[slot].present &&
+        (eisa_slots[slot].writew != NULL)) {
+        eisa_slots[slot].writew(port, val, eisa_slots[slot].priv);
+        return;
+    }
+    eisa_write(port, (uint8_t) val, priv);
+    eisa_write((uint16_t) (port + 1), (uint8_t) (val >> 8), priv);
+}
+
+static void
+eisa_writel(uint16_t port, uint32_t val, void *priv)
+{
+    uint8_t slot = EISA_SLOT_OF(port);
+
+    if ((slot <= eisa_nr_slots) && EISA_SLOT_SPECIFIC(port) && eisa_slots[slot].present &&
+        (eisa_slots[slot].writel != NULL)) {
+        eisa_slots[slot].writel(port, val, eisa_slots[slot].priv);
+        return;
+    }
+    eisa_writew(port, (uint16_t) val, priv);
+    eisa_writew((uint16_t) (port + 2), (uint16_t) (val >> 16), priv);
+}
+
 static void
 eisa_claim(uint8_t slot, int set)
 {
@@ -135,11 +190,11 @@ eisa_claim(uint8_t slot, int set)
 
     for (uint8_t i = 0; i < 4; i++) {
         if (set)
-            io_sethandler(base + window[i], 0x0100, eisa_read, NULL, NULL,
-                          eisa_write, NULL, NULL, NULL);
+            io_sethandler(base + window[i], 0x0100, eisa_read, eisa_readw, eisa_readl,
+                          eisa_write, eisa_writew, eisa_writel, NULL);
         else
-            io_removehandler(base + window[i], 0x0100, eisa_read, NULL, NULL,
-                             eisa_write, NULL, NULL, NULL);
+            io_removehandler(base + window[i], 0x0100, eisa_read, eisa_readw, eisa_readl,
+                             eisa_write, eisa_writew, eisa_writel, NULL);
     }
 }
 
@@ -195,6 +250,21 @@ eisa_add(uint8_t slot, const uint8_t *id,
     eisa_log("EISA: slot %i = %02x%02x%02x%02x\n", slot, id[0], id[1], id[2],
              id[3]);
     return 1;
+}
+
+void
+eisa_set_wide(uint8_t slot,
+              uint16_t (*readw)(uint16_t port, void *priv),
+              void (*writew)(uint16_t port, uint16_t val, void *priv),
+              uint32_t (*readl)(uint16_t port, void *priv),
+              void (*writel)(uint16_t port, uint32_t val, void *priv))
+{
+    if ((slot < 1) || (slot > eisa_nr_slots) || !eisa_slots[slot].present)
+        return;
+    eisa_slots[slot].readw  = readw;
+    eisa_slots[slot].writew = writew;
+    eisa_slots[slot].readl  = readl;
+    eisa_slots[slot].writel = writel;
 }
 
 void

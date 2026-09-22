@@ -32,6 +32,13 @@
 typedef struct eisa_slot_t {
     uint8_t (*read)(uint16_t port, void *priv);
     void (*write)(uint16_t port, uint8_t val, void *priv);
+    /* Optional. A card that answers word and dword cycles itself sets
+       these; one that does not is read and written a byte at a time,
+       low byte first, which is what the bus would do to it. */
+    uint16_t (*readw)(uint16_t port, void *priv);
+    void (*writew)(uint16_t port, uint16_t val, void *priv);
+    uint32_t (*readl)(uint16_t port, void *priv);
+    void (*writel)(uint16_t port, uint32_t val, void *priv);
     void (*reset)(void *priv);
     void   *priv;
     uint8_t id[4]; /* the compressed product identifier, as read at zC80 */
@@ -50,6 +57,11 @@ extern uint8_t eisa_add(uint8_t slot, const uint8_t *id,
                         void (*write)(uint16_t port, uint8_t val, void *priv),
                         void (*reset)(void *priv), void *priv);
 extern void    eisa_remove(uint8_t slot);
+extern void    eisa_set_wide(uint8_t slot,
+                             uint16_t (*readw)(uint16_t port, void *priv),
+                             void (*writew)(uint16_t port, uint16_t val, void *priv),
+                             uint32_t (*readl)(uint16_t port, void *priv),
+                             void (*writel)(uint16_t port, uint32_t val, void *priv));
 extern void    eisa_reset(void);
 extern uint8_t eisa_slots_present(void);
 extern uint8_t eisa_slot_id(uint8_t slot, uint8_t byte);
