@@ -111,10 +111,16 @@ machine_at_54tdp_init(const machine_t *model)
        it is one. */
     pci_register_slot(0x07, PCI_CARD_SOUTHBRIDGE, 0, 0, 0, 0);
     /* The on-board SCSI, then the four slots. */
-    /* The BIOS only ever routes PIRQC and PIRQD, to IRQ 10 and 11. The
-       on-board SCSI is the one that has to land on a real interrupt, and
-       the board puts it on 10, so its INTA goes to PIRQC. */
-    pci_register_slot(0x08, PCI_CARD_SCSI, 3, 4, 1, 2);
+    /* The BIOS only ever routes PIRQC and PIRQD, and it programs them
+       the other way round from what this table used to assume: PIRQC to
+       IRQ 11 and PIRQD to IRQ 10 (the ESC's route registers in a POST
+       trace read 60h..63h = 80 80 0B 0A). The on-board SCSI is on IRQ 10
+       on the real board -- lspci shows 00:08.0 at irq 10 -- and the BIOS
+       tells the operating system so, so its INTA is PIRQD. With it on
+       PIRQC the chip raised IRQ 11 while Windows 2000 had its handler on
+       IRQ 10: every command on the on-board bus completed unnoticed and
+       was reset after the driver's timeout, eight seconds at a time. */
+    pci_register_slot(0x08, PCI_CARD_SCSI, 4, 1, 2, 3);
     pci_register_slot(0x09, PCI_CARD_VIDEO, 4, 1, 2, 3);
     pci_register_slot(0x0a, PCI_CARD_NORMAL, 3, 4, 1, 2);
     pci_register_slot(0x0b, PCI_CARD_NORMAL, 4, 1, 2, 3);
