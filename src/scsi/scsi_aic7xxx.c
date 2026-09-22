@@ -685,7 +685,8 @@ typedef struct aic7xxx_t {
     uint8_t    msgin_pos;
     aic_cmd_t  cmds[AIC_CMDS];
 
-    char tag[16]; /* which board this one is, for the log */
+    char     tag[16]; /* which board this one is, for the log */
+    uint32_t hcntrl_logs; /* how many HCNTRL writes have been traced */
 
     pc_timer_t seq_timer;
     pc_timer_t sel_timer;
@@ -841,8 +842,20 @@ aic_update_irq(aic7xxx_t *dev)
 static void
 aic_int_pause(aic7xxx_t *dev)
 {
-    if (dev->intstat & (BRKADRINT | SCSIINT | SEQINT))
-        dev->hcntrl |= PAUSE;
+    /* NOT DONE HERE, and the reason is measured rather than argued.
+       Latching it deadlocks the AHA-2740's option ROM outright. Its
+       sequencer raises SEQINT with reason code 8, its host side does not
+       recognise that code and never writes CLRINT, and it sits pausing
+       and unpausing for ever -- forty five million times in one run. With
+       the pause taken from INTSTAT alone the same firmware keeps running,
+       reaches its own timeout and carries on, which is worse behaviour
+       than it should have but is progress rather than a stop.
+
+       So the latch waits on the code 8 it is entangled with. What it does
+       fix is real -- ninety illegal host accesses a POST, and the card
+       installing when a drive answers -- but not at the price of a box
+       that will not finish POST. See the notes in ~/src/86aic/eisa. */
+    (void) dev;
 }
 
 static void
@@ -1396,7 +1409,18 @@ aic_tgt_take(aic7xxx_t *dev, uint8_t val)
                         reply[4]        = (dev->msgout[4] > 15) ? 15 : dev->msgout[4];
                         dev->msgout_len = 0;
                         aic_msgin(dev, reply, 5, AFTER_NEXT);
-                        aic_bus_changed(dev);
+                        /* The reply needs a REQ of its own. REQINIT is an
+                           edge -- see aic_bus_changed -- and message out
+                           left REQ asserted, so asserting it again here
+                           makes no edge at all and the firmware never
+                           sees the answer: the AHA-2740's ROM sends its
+                           SDTR, waits on REQINIT in a one instruction
+                           loop at sequencer address 145h, and stays
+                           there. A real target drops REQ when it sees
+                           ACK and raises it again once ACK has gone, and
+                           that is what every other phase change here
+                           goes through. */
+                        aic_tgt_req_again(dev);
                         return;
                     }
                     if ((n >= 2) && (dev->msgout[2] == 0x03)) { /* WDTR */
@@ -1406,7 +1430,8 @@ aic_tgt_take(aic7xxx_t *dev, uint8_t val)
                         reply[3]        = (dev->wide && dev->msgout[3]) ? 0x01 : 0x00;
                         dev->msgout_len = 0;
                         aic_msgin(dev, reply, 4, AFTER_NEXT);
-                        aic_bus_changed(dev);
+                        /* And so does this one, for the same reason. */
+                        aic_tgt_req_again(dev);
                         return;
                     }
                     dev->msgout_len = 0;
@@ -1650,7 +1675,34 @@ aic_reselect_try(aic7xxx_t *dev)
     dev->selid     = (uint8_t) (c->id << 4);
     if (dev->scsiseq & ENAUTOATNI)
         dev->atn = 1;
-    aic_log(dev->tag, "[%.3f ms] reselect %i lun %i tag %02x\n", aic_now_us() / 1000.0, c->id, c->lun, c->tagged ? c->tag : 0xff);
+
+    /* Which channel the target came back on, latched into SBLKCTL before
+       the reselection is reported.
+
+       The firmware needs that and cannot work it out. Its poll loop flips
+       SELBUSB every pass -- "xor SBLKCTL, SELBUSB" sits between the two
+       status tests -- so by the time a reselection arrives the bit is
+       whichever way the last flip left it. What it then does, at
+       sequencer address 01Dh, is walk its four SCBs looking for one that
+       is active and whose channel bit agrees with SBLKCTL, and if none
+       does it reports INTCODE 8 and stops. A coin toss decided whether
+       the search could succeed.
+
+       Real hardware switches the register file to the channel the
+       reconnection happened on, which is what makes the comparison mean
+       anything; only a part with the bit has a channel to switch. On a
+       board wired for one the answer is always channel A, and saying so
+       is what lets a single-channel card finish a reselection at all. */
+    if (dev->chip->sblkctl_mask & SELBUSB) {
+        if (dev->twin && (c->bus == dev->bus_b))
+            dev->sblkctl |= SELBUSB;
+        else
+            dev->sblkctl &= ~SELBUSB;
+    }
+
+    aic_log(dev->tag, "[%.3f ms] reselect %i lun %i tag %02x on channel %c\n",
+            aic_now_us() / 1000.0, c->id, c->lun, c->tagged ? c->tag : 0xff,
+            (dev->sblkctl & SELBUSB) ? 'B' : 'A');
     aic_set_sstat0(dev, SELDI);
 
     /* A reconnecting target identifies itself, and if the command was
@@ -2654,17 +2706,56 @@ aic_write(aic7xxx_t *dev, uint8_t addr, uint8_t val, int seq)
                "will force SELBUSB and SELWIDE to be cleared". The later
                parts put their diagnostic LED and FIFO bits in the same
                register, so they keep the wider mask. */
-            /* SELBUSB is a control bit, not a strap. The straps decide what
-               the register comes up holding; they do not make it read only.
-               The firmware switches channel by writing it -- "and SINDEX,
-               ~SELBUSB, SBLKCTL / and A, SELBUSB, SCB_TCL / or SINDEX, A /
-               mov SBLKCTL, SINDEX" -- and then compares SCB_TCL against
-               SBLKCTL and puts the command back on the queue if the two
-               still disagree. Throwing the write away on a board with one
-               channel therefore does not keep it on channel A: it hangs it,
-               because the command it wants to run is never startable. */
-            dev->sblkctl = val & dev->chip->sblkctl_mask &
-                           ~(dev->wide ? 0 : SELWIDE);
+            /* What the straps will not let the bit do. An earlier note
+               here had this the other way round -- it said the straps
+               only decide what the register comes up holding and do not
+               make it read only, and that refusing the write would hang
+               a single channel board. Both halves were wrong, and the
+               note is what kept the AHA-2740 broken.
+
+               The book forces it: "BMSG-=GND and BBSY-=VDD indicates
+               that Channel B is not being used and will force SELBUSB
+               and SELWIDE to be cleared", with the reset table giving
+               00h for Channel A only, 08h for DualBusses and 02h for
+               Wide. Forced, not merely initialised -- the pins are tied,
+               so there is no channel there to switch to.
+
+               And it is the whole register block that switches, not a
+               mode: "Device addresses 00h-1Eh reflect the Channel B
+               registers. When this bit is cleared, addresses 00h-1Eh
+               reflect Channel A registers", with both channels "mapped
+               to the same I/O space". This model has one copy of that
+               block, which is correct for a board with one channel and
+               is why a twin one still needs work.
+
+               Far from hanging the card, this is what makes it run. Its
+               firmware flips the bit on every pass of its poll loop --
+               "xor SBLKCTL, SELBUSB" sits between the SELTO test and the
+               SELDO test -- and then, having seen a selection or a
+               reselection, walks its SCBs for one whose channel bit
+               agrees with SBLKCTL, reporting INTCODE 8 and stopping if
+               none does. On real silicon the flip is harmless twice
+               over: on a one channel board the bit cannot move, and on a
+               twin one the status it tests belongs to whichever channel
+               it is looking at. Letting the bit move here while only one
+               cell exists meant the comparison failed whenever the flip
+               landed on B -- which is half the time.
+
+               SELWIDE forces it too: "If SELWIDE (bit 1) is set, this
+               bit will be cleared", the wide connection being channel
+               B's data lines lent to channel A. */
+            {
+                uint8_t forced = 0;
+
+                if (!dev->twin)
+                    forced |= SELBUSB;
+                if (!dev->wide)
+                    forced |= SELWIDE;
+                if (val & SELWIDE)
+                    forced |= SELBUSB;
+
+                dev->sblkctl = val & dev->chip->sblkctl_mask & ~forced;
+            }
             break;
         case SCSITEST:
             /* RQAKCNT, CNTRTEST and CTSTMODE, and nothing above them. */
@@ -2785,10 +2876,25 @@ aic_write(aic7xxx_t *dev, uint8_t addr, uint8_t val, int seq)
             aic_pump(dev);
             break;
         case HCNTRL:
-            if (!seq && ((val ^ dev->hcntrl) & CHIPRST)) {
-                aic_log(dev->tag, "host: HCNTRL %02x at pc %03x (intstat %02x)\n", val,
-                        dev->pc, dev->intstat);
+            /* Pausing and unpausing is how a driver takes the part away
+               from the sequencer and gives it back, so a trace that omits
+               it cannot say whether the sequencer is stopped because it
+               was told to be or because this model forgot to let it go.
+               It also happens in the tightest loop either side runs: a
+               firmware that is spinning writes this register millions of
+               times, and logging every one of them put 2.8 GB on disc in
+               three minutes and left the emulator doing nothing else. So
+               the first few hundred are logged, and then one in every
+               hundred thousand to show it is still going. */
+            if (!seq && ((dev->hcntrl_logs < 256) ||
+                         ((dev->hcntrl_logs % 100000) == 0))) {
+                aic_log(dev->tag, "host: HCNTRL %02x -> %02x at pc %03x "
+                        "(intstat %02x, was %s)%s\n", val, dev->hcntrl, dev->pc,
+                        dev->intstat, aic_paused(dev) ? "paused" : "running",
+                        (dev->hcntrl_logs >= 256) ? " [1 in 100000]" : "");
             }
+            if (!seq)
+                dev->hcntrl_logs++;
             was         = dev->hcntrl;
             dev->hcntrl = val & ~CHIPRST;
             if (val & CHIPRST) {
