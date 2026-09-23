@@ -77,6 +77,8 @@ extern const device_t ide_cmd640_pci_single_channel_device;     /* CMD PCI-640B 
 extern const device_t ide_cmd640_pci_single_channel_sec_device; /* CMD PCI-640B PCI (Only secondary channel) */
 extern const device_t ide_cmd640_pci_single_channel_legacy_only_device; /* CMD PCI-640B PCI (Legacy Mode Only/Only primary channel) */
 extern const device_t ide_cmd646_device;                        /* CMD PCI-646 */
+extern const device_t pdc20269_device;                          /* Promise Ultra133 TX2 */
+extern const device_t pdc20271_device;                          /* Promise FastTrak TX2000 */
 extern const device_t ide_cmd646_legacy_only_device;            /* CMD PCI-646 (Legacy Mode Only) */
 extern const device_t ide_cmd646_single_channel_device;         /* CMD PCI-646 (Only primary channel) */
 extern const device_t ide_cmd646_ter_qua_device;                /* CMD PCI-646 (Tertiary and quaternary channels) */
