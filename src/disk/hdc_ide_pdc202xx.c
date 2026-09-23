@@ -878,9 +878,13 @@ pdc_reset(void *priv)
     dev->pci_regs[0x1c] = 0x01;
     dev->pci_regs[0x20] = 0x01;
 
+    /* The retail Ultra133 TX2 carries subsystem 105A:4D68, not its own
+       device ID, and BIOS 2.20.0.12 and the Maxtor 2.20.0050.10 build
+       require it: they read config word 2Eh and pass over any PDC20269
+       that says otherwise, then report that they cannot find the card. */
     dev->pci_regs[0x2c] = 0x5a;
     dev->pci_regs[0x2d] = 0x10;
-    dev->pci_regs[0x2e] = id & 0xff;
+    dev->pci_regs[0x2e] = (dev->card == PDC_ULTRA133) ? 0x68 : (id & 0xff);
     dev->pci_regs[0x2f] = id >> 8;
 
     dev->pci_regs[0x3d] = PCI_INTA;
