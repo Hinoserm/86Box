@@ -5100,11 +5100,9 @@ aic_init(const device_t *info)
     dev->pci_regs[DEVCONFIG + 2] = 0x00;
     dev->pci_regs[DEVCONFIG + 3] = 0x00;
 
-    /* How long the device itself takes over a command, which is off unless
-       asked for: the seek and the rotation are modelled but the transfer is
-       not, so what it buys in fidelity it spends twice over in latency.
-       The part on a motherboard has no settings and does without. */
-    dev->timed_dev = (dev->board == BOARD_7880) ? 0 : device_get_config_int("dev_timing");
+    /* How long the device itself takes over a command: the seek and the
+       rotation 86Box models for the drive, on every board. */
+    dev->timed_dev = 1;
 
     if (dev->eisa) {
         uint8_t id[4];
@@ -5350,17 +5348,6 @@ static const device_config_t aic7770_config[] = {
         },
         .bios           = { { 0 } }
     },
-    {
-        .name           = "dev_timing",
-        .description    = "Model device access times",
-        .type           = CONFIG_BINARY,
-        .default_string = NULL,
-        .default_int    = 0,
-        .file_filter    = NULL,
-        .spinner        = { 0 },
-        .selection      = { { 0 } },
-        .bios           = { { 0 } }
-    },
     { .name = "", .description = "", .type = CONFIG_END }
     // clang-format on
 };
@@ -5421,17 +5408,6 @@ static const device_config_t aic7770_fdc_config[] = {
             { .description = "Slot 4", .value = 4 },
             { .description = ""                   }
         },
-        .bios           = { { 0 } }
-    },
-    {
-        .name           = "dev_timing",
-        .description    = "Model device access times",
-        .type           = CONFIG_BINARY,
-        .default_string = NULL,
-        .default_int    = 0,
-        .file_filter    = NULL,
-        .spinner        = { 0 },
-        .selection      = { { 0 } },
         .bios           = { { 0 } }
     },
     {
@@ -5520,17 +5496,6 @@ static const device_config_t aic_card_config[] = {
             { .files_no = 0 }
         },
     },
-    {
-        .name           = "dev_timing",
-        .description    = "Device timing",
-        .type           = CONFIG_BINARY,
-        .default_string = NULL,
-        .default_int    = 0,
-        .file_filter    = NULL,
-        .spinner        = { 0 },
-        .selection      = { { 0 } },
-        .bios           = { { 0 } }
-    },
     { .name = "", .description = "", .type = CONFIG_END }
     // clang-format on
 };
@@ -5569,17 +5534,6 @@ static const device_config_t aha2944uw_config[] = {
             },
             { .files_no = 0 }
         },
-    },
-    {
-        .name           = "dev_timing",
-        .description    = "Device timing",
-        .type           = CONFIG_BINARY,
-        .default_string = NULL,
-        .default_int    = 0,
-        .file_filter    = NULL,
-        .spinner        = { 0 },
-        .selection      = { { 0 } },
-        .bios           = { { 0 } }
     },
     { .name = "", .description = "", .type = CONFIG_END }
     // clang-format on
@@ -5637,17 +5591,6 @@ static const device_config_t aha2940_config[] = {
             },
             { .files_no = 0 }
         },
-    },
-    {
-        .name           = "dev_timing",
-        .description    = "Device timing",
-        .type           = CONFIG_BINARY,
-        .default_string = NULL,
-        .default_int    = 0,
-        .file_filter    = NULL,
-        .spinner        = { 0 },
-        .selection      = { { 0 } },
-        .bios           = { { 0 } }
     },
     { .name = "", .description = "", .type = CONFIG_END }
     // clang-format on
