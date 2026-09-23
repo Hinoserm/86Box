@@ -247,9 +247,10 @@ pdc_indexed_read(pdc_t *dev, int channel)
 {
     uint8_t index = dev->idx[channel];
 
-    if ((index != PDC_I_COUNT_L) && (index != PDC_I_COUNT_H))
+    if ((index != PDC_I_COUNT_L) && (index != PDC_I_COUNT_H)) {
         pdc_log("PDC202xx: ch%i indexed %02X -> %02X\n", channel, index,
                 dev->ireg[channel][index]);
+    }
 
     switch (index) {
         case PDC_I_COUNT_L:
@@ -386,10 +387,11 @@ pdc_bm_read(uint16_t port, void *priv)
                    channel that says one is already running. */
                 if (((offset & 7) == 2) && !(dev->bm[channel]->command & 0x01))
                     ret &= ~0x01;
-                if ((offset & 7) == 2)
+                if ((offset & 7) == 2) {
                     pdc_log("PDC202xx: ch%i bus master status -> %02X\n", channel, ret);
-                else if ((offset & 7) == 0)
+                } else if ((offset & 7) == 0) {
                     pdc_log("PDC202xx: ch%i bus master command -> %02X\n", channel, ret);
+                }
                 break;
         }
     } else switch (offset) {
