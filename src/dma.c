@@ -2041,7 +2041,6 @@ dma_eisa_init(void)
     dma_eisa          = 1;
 }
 
-
 void
 dma_reset(void)
 {
@@ -2349,8 +2348,7 @@ dma_stop_check(int channel)
     if (!(dma_stop_en & (1 << channel)))
         return;
 
-    stop = dma_stop[channel][0] | (dma_stop[channel][1] << 8) |
-           (dma_stop[channel][2] << 16);
+    stop = dma_stop[channel][0] | (dma_stop[channel][1] << 8) | (dma_stop[channel][2] << 16);
 
     if ((dma[channel].ac & 0x00fffffc) == (stop & 0x00fffffc))
         dma_m |= (1 << channel);

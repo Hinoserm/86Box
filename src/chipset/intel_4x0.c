@@ -256,9 +256,9 @@ i4x0_dram_hole(uint8_t old_val, uint8_t new_val)
 {
     static const uint32_t hole_base[4] = { 0, 0x00080000, 0x00f00000, 0 };
     static const uint32_t hole_size[4] = { 0, 0x00020000, 0x00100000, 0 };
-    uint8_t  old_hen = (old_val >> 6) & 3;
-    uint8_t  new_hen = (new_val >> 6) & 3;
-    uint64_t ram_top = ((uint64_t) mem_size) << 10; /* mem_size is in KiB */
+    uint8_t               old_hen      = (old_val >> 6) & 3;
+    uint8_t               new_hen      = (new_val >> 6) & 3;
+    uint64_t              ram_top      = ((uint64_t) mem_size) << 10; /* mem_size is in KiB */
 
     if (old_hen == new_hen)
         return;
@@ -682,18 +682,20 @@ i4x0_write(int func, int addr, UNUSED(int len), uint8_t val, void *priv)
                         break;
                     case INTEL_430FX:
                     case INTEL_430HX:
-                    case INTEL_430VX: {
-                        uint8_t old_dramc = regs[0x57];
-                        regs[0x57] = val & 0xcf;
-                        i4x0_dram_hole(old_dramc, regs[0x57]);
-                        break;
-                    }
-                    case INTEL_430TX: {
-                        uint8_t old_dramc = regs[0x57];
-                        regs[0x57] = val & 0xdf;
-                        i4x0_dram_hole(old_dramc, regs[0x57]);
-                        break;
-                    }
+                    case INTEL_430VX:
+                        {
+                            uint8_t old_dramc = regs[0x57];
+                            regs[0x57]        = val & 0xcf;
+                            i4x0_dram_hole(old_dramc, regs[0x57]);
+                            break;
+                        }
+                    case INTEL_430TX:
+                        {
+                            uint8_t old_dramc = regs[0x57];
+                            regs[0x57]        = val & 0xdf;
+                            i4x0_dram_hole(old_dramc, regs[0x57]);
+                            break;
+                        }
                     case INTEL_440FX:
                         regs[0x57] = val & 0x77;
                         break;

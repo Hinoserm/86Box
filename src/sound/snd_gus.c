@@ -11,10 +11,12 @@
  * Authors: Sarah Walker, <https://pcem-emulator.co.uk/>
  *          Miran Grca, <mgrca8@gmail.com>
  *          win2kgamer
+ *          mr b0nk 500, <b0nk@b0nk.xyz>
  *
  *          Copyright 2010-2020 Sarah Walker.
  *          Copyright 2016-2025 Miran Grca.
  *          Copyright      2026 win2kgamer
+ *          Copyright      2026 mr b0nk 500
  */
 
 /*
@@ -736,7 +738,7 @@ gus_write(uint16_t addr, uint8_t val, void *priv)
                     break;
 
                 case 0x43: /*Address low*/
-                    if (gus->type == GUS_INTERWAVE && gus->iw_enhanced)
+                    if (gus->type == GUS_INTERWAVE)
                         gus->addr = (gus->addr & 0xFFFF00) | val;
                     else
                         gus->addr = (gus->addr & 0xFFF00) | val;
@@ -891,10 +893,10 @@ gus_write(uint16_t addr, uint8_t val, void *priv)
                 case 0x10: /* Synthesizer Upper Address */
                     if (gus->type == GUS_INTERWAVE) {
                         gus->synth_upper[gus->voice] = val;
-                        gus->start[gus->voice]  = (gus->start[gus->voice] & 0x7FFFFFFF) | ((val & 0x03) << 31);
-                        gus->end[gus->voice]  = (gus->end[gus->voice] & 0x7FFFFFFF) | ((val & 0x03) << 31);
-                        gus->cur[gus->voice]  = (gus->cur[gus->voice] & 0x7FFFFFFF) | ((val & 0x03) << 31);
-                        gus->effects_addr[gus->voice] = (gus->effects_addr[gus->voice] & 0x7FFFFFFF) | ((val & 0x03) << 31);
+                        gus->start[gus->voice]  = (gus->start[gus->voice] & 0x7FFFFFFF) | ((uint64_t) (val & 0x03) << 31);
+                        gus->end[gus->voice]  = (gus->end[gus->voice] & 0x7FFFFFFF) | ((uint64_t) (val & 0x03) << 31);
+                        gus->cur[gus->voice]  = (gus->cur[gus->voice] & 0x7FFFFFFF) | ((uint64_t) (val & 0x03) << 31);
+                        gus->effects_addr[gus->voice] = (gus->effects_addr[gus->voice] & 0x7FFFFFFF) | ((uint64_t) (val & 0x03) << 31);
                     }
                     break;
                 case 0x11: /* Synthesizer Effects Address High */
@@ -1123,13 +1125,13 @@ gus_write(uint16_t addr, uint8_t val, void *priv)
                     break;
 
                 case 0x43: /*Address low*/
-                    if (gus->type == GUS_INTERWAVE && gus->iw_enhanced)
+                    if (gus->type == GUS_INTERWAVE)
                         gus->addr = (gus->addr & 0xff00ff) | (val << 8);
                     else
                         gus->addr = (gus->addr & 0xf00ff) | (val << 8);
                     break;
                 case 0x44: /*Address high*/
-                    if (gus->type == GUS_INTERWAVE && gus->iw_enhanced)
+                    if (gus->type == GUS_INTERWAVE)
                         gus->addr = (gus->addr & 0x00ffff) | ((val << 16) & 0xff0000);
                     else
                         gus->addr = (gus->addr & 0x0ffff) | ((val << 16) & 0xf0000);
@@ -1304,17 +1306,14 @@ gus_write(uint16_t addr, uint8_t val, void *priv)
             break;
         case 0x307: /*DRAM access*/
             if (gus->addr < gus->gus_end_ram) {
+                uint32_t gus_addr_mask = (gus->type == GUS_INTERWAVE && gus->iw_enhanced) ? 0xffffff : 0xfffff;
                 if (gus->type == GUS_INTERWAVE && gus->lmc_ctrl & 0x08)
-                    gus->ram[gus->addr] = val ^ 0x80;
+                    gus->ram[gus->addr & gus_addr_mask] = val ^ 0x80;
                 else
-                    gus->ram[gus->addr] = val;
+                    gus->ram[gus->addr & gus_addr_mask] = val;
             }
             if (gus->lmc_ctrl & 1)
                 gus->addr++;
-            if (gus->type == GUS_INTERWAVE && gus->iw_enhanced)
-                gus->addr &= (gus->gus_end_ram - 1);
-            else
-                gus->addr &= 0xfffff;
             gus_log(gus->log, "GUS write: port = %04X, val = %02X, gus_addr = %08X\n", addr, val, gus->addr);
             break;
         case 0x208:
@@ -2057,38 +2056,40 @@ gus_read(uint16_t addr, void *priv)
             break;
 
         case 0x307: /*DRAM access*/
+        {
+            uint32_t addr8 = gus->addr;
             if (gus->type == GUS_INTERWAVE && gus->iw_enhanced && !(gus->lmc_ctrl & 0x02)) {
-                gus->addr &= (gus->gus_end_ram - 1);
-                switch (gus->addr & 0xc00000) {
+                addr8 &= (gus->gus_end_ram - 1);
+                switch (addr8 & 0xc00000) {
                     case 0:
-                        gus->addr &= gus->iw_bank_mask[0];
+                        addr8 &= gus->iw_bank_mask[0];
                         break;
                     case 0x400000:
                         if (!gus->iw_bank_mask[1])
-                            gus->addr = gus->gus_end_ram;
+                            addr8 = gus->gus_end_ram;
                         else
-                            gus->addr &= (0x400000 | gus->iw_bank_mask[1]);
+                            addr8 &= (0x400000 | gus->iw_bank_mask[1]);
                         break;
                     case 0x800000:
                         if (!gus->iw_bank_mask[2])
-                            gus->addr = gus->gus_end_ram;
+                            addr8 = gus->gus_end_ram;
                         else
-                            gus->addr &= (0x800000 | gus->iw_bank_mask[2]);
+                            addr8 &= (0x800000 | gus->iw_bank_mask[2]);
                         break;
                     case 0xc00000:
                         if (!gus->iw_bank_mask[3])
-                            gus->addr = gus->gus_end_ram;
+                            addr8 = gus->gus_end_ram;
                         else
-                            gus->addr &= (0xc00000 | gus->iw_bank_mask[3]);
+                            addr8 &= (0xc00000 | gus->iw_bank_mask[3]);
                         break;
                 }
             }
             else if (!(gus->lmc_ctrl & 0x02))
-                gus->addr &= 0xfffff;
-            if (gus->type == GUS_INTERWAVE && gus->lmc_ctrl & 0x02  && gus->addr <= gus->gus_end_rom)
-                val = gus->rom[gus->addr];
-            else if ((gus->iw_enhanced && gus->addr < gus->gus_end_ram) || (!gus->iw_mem_512 && gus->addr < gus->gus_end_ram) || (!gus->iw_enhanced && gus->iw_mem_512 && gus->addr < 0x80000))
-                val = gus->ram[gus->addr];
+                addr8 &= 0xfffff;
+            if (gus->type == GUS_INTERWAVE && gus->lmc_ctrl & 0x02  && addr8 <= gus->gus_end_rom)
+                val = gus->rom[addr8];
+            else if ((gus->iw_enhanced && addr8 < gus->gus_end_ram) || (!gus->iw_mem_512 && addr8 < gus->gus_end_ram) || (!gus->iw_enhanced && gus->iw_mem_512 && addr8 < 0x80000))
+                val = gus->ram[addr8];
             else
                 val = 0;
             if (gus->lmc_ctrl & 1)
@@ -2098,6 +2099,7 @@ gus_read(uint16_t addr, void *priv)
             else
                 gus_log(gus->log, "GUS read: port = %04X, val = %02X, gus_addr = %08X\n", addr, val, gus->addr);
             return val;
+        }
         case 0x309:
             gus_log(gus->log, "GUS read: port = %04X, val = %02X\n", addr, 0);
             return 0;
@@ -2412,7 +2414,7 @@ gus_poll_wave(void *priv)
     for (uint8_t d = 0; d < 32; d++) {
         uint8_t mulaw = (gus->type == GUS_INTERWAVE && gus->iw_enhanced && (gus->synth_mode[d] & 0x40)) ? 1 : 0;
         if (!(gus->ctrl[d] & 3) && (gus->type != GUS_INTERWAVE || !gus->iw_enhanced || !(gus->synth_mode[d] & 0x02))) {
-            uint16_t tempfreq = gus->freq[d];
+            int16_t tempfreq = gus->freq[d];
             if (gus->ctrl[d] & 4) {
                 addr = gus->cur[d] >> 9;
                 if (gus->type == GUS_INTERWAVE && gus->iw_enhanced)
@@ -2420,9 +2422,12 @@ gus_poll_wave(void *priv)
                 else
                     addr = (addr & 0xC0000) | ((addr << 1) & 0x3FFFE);
                 if (gus->type == GUS_INTERWAVE && gus->iw_enhanced && (gus->synth_global & 0x02)) {
-                    if (gus->lfo_freq[d] & 0x80)
-                        tempfreq -= (gus->lfo_freq[d] & 0x7f);
-                    else
+                    if (gus->lfo_freq[d] & 0x80) {
+                        if ((tempfreq - (gus->lfo_freq[d] & 0x7f)) < 1)
+                            tempfreq = 1;
+                        else
+                            tempfreq -= (gus->lfo_freq[d] & 0x7f);
+                    } else
                         tempfreq += (gus->lfo_freq[d] & 0x7f);
                 }
                 if (!(tempfreq >> 10)) {
@@ -2462,9 +2467,12 @@ gus_poll_wave(void *priv)
                     v = 0x0000;
             } else {
                 if (gus->type == GUS_INTERWAVE && gus->iw_enhanced && (gus->synth_global & 0x02)) {
-                    if (gus->lfo_freq[d] & 0x80)
-                        tempfreq -= (gus->lfo_freq[d] & 0x7f);
-                    else
+                    if (gus->lfo_freq[d] & 0x80) {
+                        if ((tempfreq - (gus->lfo_freq[d] & 0x7f)) < 1)
+                            tempfreq = 1;
+                        else
+                            tempfreq -= (gus->lfo_freq[d] & 0x7f);
+                    } else
                         tempfreq += (gus->lfo_freq[d] & 0x7f);
                 }
                 if (!(tempfreq >> 10)) {
@@ -2525,7 +2533,7 @@ gus_poll_wave(void *priv)
             else
                 v = (int16_t) (float) (v) *24.0 * vol16bit[(temp_rcur >> 10) & 4095];
 
-            if (gus->type == GUS_INTERWAVE && (gus->synth_mode[gus->voice] & 0x20)) {
+            if (gus->type == GUS_INTERWAVE && (gus->synth_mode[d] & 0x20)) {
                 gus->out_l += (v * vol16bit[gus->pan_l[d]]);
                 gus->out_r += (v * vol16bit[gus->pan_r[d]]);
 

@@ -53,7 +53,7 @@ typedef const struct {
 } SCSI_CARD;
 
 static SCSI_CARD scsi_cards[] = {
-  // clang-format off
+    // clang-format off
     { &device_none,              },
     /* ISA */
     { &scsi_lcs6821n_device,     },
@@ -119,7 +119,7 @@ static SCSI_CARD scsi_cards[] = {
     { &qla12160a_device,         },
     { &dc390_pci_device,         },
     { NULL,                      },
-  // clang-format on
+    // clang-format on
 };
 
 void

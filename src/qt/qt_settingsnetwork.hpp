@@ -16,7 +16,7 @@ public:
 
     int  changed();
     /* The card chosen in row i of the page, as the settings stand now. */
-    int  netCard(int i) const;
+    int netCard(int i) const;
 
     void restore();
     void save(int soft);

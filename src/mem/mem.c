@@ -2305,28 +2305,19 @@ mem_mapping_apply_granule(mem_mapping_t *map, uint64_t c, int n)
 {
     uint8_t wp = _mem_wp[c >> MEM_GRANULARITY_BITS];
 
-    if (map->exec && mem_mapping_access_allowed(map->flags,
-                     _mem_state[c >> MEM_GRANULARITY_BITS].states[n].x))
+    if (map->exec && mem_mapping_access_allowed(map->flags, _mem_state[c >> MEM_GRANULARITY_BITS].states[n].x))
         _mem_exec[c >> MEM_GRANULARITY_BITS] = map->exec + (c - map->base);
-    if (!wp && (map->write_b || map->write_w || map->write_l) &&
-        mem_mapping_access_allowed(map->flags,
-                                   _mem_state[c >> MEM_GRANULARITY_BITS].states[n].w))
+    if (!wp && (map->write_b || map->write_w || map->write_l) && mem_mapping_access_allowed(map->flags, _mem_state[c >> MEM_GRANULARITY_BITS].states[n].w))
         write_mapping[c >> MEM_GRANULARITY_BITS] = map;
-    if ((map->read_b || map->read_w || map->read_l) &&
-        mem_mapping_access_allowed(map->flags,
-                                   _mem_state[c >> MEM_GRANULARITY_BITS].states[n].r))
+    if ((map->read_b || map->read_w || map->read_l) && mem_mapping_access_allowed(map->flags, _mem_state[c >> MEM_GRANULARITY_BITS].states[n].r))
         read_mapping[c >> MEM_GRANULARITY_BITS] = map;
 
     n |= STATE_BUS;
     wp = _mem_wp_bus[c >> MEM_GRANULARITY_BITS];
 
-    if (!wp && (map->write_b || map->write_w || map->write_l) &&
-        mem_mapping_access_allowed(map->flags,
-                                   _mem_state[c >> MEM_GRANULARITY_BITS].states[n].w))
+    if (!wp && (map->write_b || map->write_w || map->write_l) && mem_mapping_access_allowed(map->flags, _mem_state[c >> MEM_GRANULARITY_BITS].states[n].w))
         write_mapping_bus[c >> MEM_GRANULARITY_BITS] = map;
-    if ((map->read_b || map->read_w || map->read_l) &&
-        mem_mapping_access_allowed(map->flags,
-                                   _mem_state[c >> MEM_GRANULARITY_BITS].states[n].r))
+    if ((map->read_b || map->read_w || map->read_l) && mem_mapping_access_allowed(map->flags, _mem_state[c >> MEM_GRANULARITY_BITS].states[n].r))
         read_mapping_bus[c >> MEM_GRANULARITY_BITS] = map;
 }
 
