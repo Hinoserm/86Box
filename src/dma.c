@@ -532,6 +532,33 @@ dma_transfer_size(dma_t *dev)
     return dev->transfer_mode & 0xff;
 }
 
+/* EISA extended mode (82374EB ESC, 82357 ISP), transfer size, bits 3:2 of
+   the channel's extended mode register: 00 8-bit I/O counted in bytes,
+   01 16-bit I/O counted in words with the address shifted (the ISA
+   16-bit channel), 11 16-bit I/O counted in bytes with the address not
+   shifted -- the one Windows NT's EISA HAL programs for a 16-bit ISA
+   device. Counted in bytes, each 16-bit transfer takes two from the count. */
+static int
+dma_ext_size(const dma_t *dev)
+{
+    return (dev->ext_mode >> 2) & 0x03;
+}
+
+static int
+dma_count_step(const dma_t *dev)
+{
+    return (dma_eisa && (dma_ext_size(dev) == 0x03)) ? 2 : 1;
+}
+
+/* A 16-bit channel's address register holds a word address (A1-A16) and
+   its page register A17-A23 only while it counts in words; in the byte
+   modes both hold the byte address as written. */
+static int
+dma_addr_shifted(const dma_t *dev)
+{
+    return !dma_eisa || (dma_ext_size(dev) == 0x01);
+}
+
 static void
 dma_sg_next_addr(dma_t *dev)
 {
@@ -852,9 +879,11 @@ dma_ext_mode_write(uint16_t addr, uint8_t val, UNUSED(void *priv))
     switch ((val >> 2) & 0x03) {
         case 0x00:
             dma[channel].transfer_mode = 0x0101;
+            dma[channel].size          = 0;
             break;
         case 0x01:
             dma[channel].transfer_mode = 0x0202;
+            dma[channel].size          = 1;
             break;
         case 0x02: /* 0x02 is reserved. */
             /* Logic says this should be an undocumented mode that counts by words,
@@ -862,7 +891,10 @@ dma_ext_mode_write(uint16_t addr, uint8_t val, UNUSED(void *priv))
             dma[channel].transfer_mode = 0x0201;
             break;
         case 0x03:
-            dma[channel].transfer_mode = 0x0102;
+            /* 16-bit I/O counted in bytes: the address steps by two, as
+               the count does (dma_count_step). */
+            dma[channel].transfer_mode = 0x0202;
+            dma[channel].size          = 1;
             break;
 
         default:
@@ -1471,7 +1503,7 @@ dma16_read(uint16_t addr, UNUSED(void *priv))
         case 4:
         case 6: /*Address registers*/
             dma_wp[1] ^= 1;
-            if (dma_ps2.is_ps2) {
+            if (dma_ps2.is_ps2 || !dma_addr_shifted(&dma[channel])) {
                 if (dma_wp[1])
                     ret = (dma[channel].ac);
                 else
@@ -1539,6 +1571,11 @@ dma16_write(uint16_t addr, uint8_t val, UNUSED(void *priv))
         case 6: /*Address registers*/
             dma_wp[1] ^= 1;
             if (dma_ps2.is_ps2) {
+                if (dma_wp[1])
+                    dma[channel].ab = (dma[channel].ab & 0xffffff00 & dma_mask) | val;
+                else
+                    dma[channel].ab = (dma[channel].ab & 0xffff00ff & dma_mask) | (val << 8);
+            } else if (!dma_addr_shifted(&dma[channel])) {
                 if (dma_wp[1])
                     dma[channel].ab = (dma[channel].ab & 0xffffff00 & dma_mask) | val;
                 else
@@ -1657,10 +1694,15 @@ dma_page_write(uint16_t addr, uint8_t val, UNUSED(void *priv))
     if (addr < 8) {
         dma[addr].page_l = val;
 
-        if (addr > 4) {
+        if ((addr > 4) && dma_addr_shifted(&dma[addr])) {
             dma[addr].page = val & 0xfe;
             dma[addr].ab   = (dma[addr].ab & 0xff01ffff & dma_mask) | (dma[addr].page << 16);
             dma[addr].ac   = (dma[addr].ac & 0xff01ffff & dma_mask) | (dma[addr].page << 16);
+        } else if (addr > 4) {
+            /* Counting in bytes, the page is A16-A23 whole. */
+            dma[addr].page = val;
+            dma[addr].ab   = (dma[addr].ab & 0xff00ffff & dma_mask) | (dma[addr].page << 16);
+            dma[addr].ac   = (dma[addr].ac & 0xff00ffff & dma_mask) | (dma[addr].page << 16);
         } else {
             dma[addr].page = dma_page_is_xt() ? (val & 0x0f) : val;
             dma[addr].ab   = (dma[addr].ab & 0xff00ffff & dma_mask) | (dma[addr].page << 16);
@@ -1803,6 +1845,10 @@ dma_reset_legacy(void)
         dma[c].ps2_mode      = (dma_ps2.is_ps2 && (c & 4)) ? DMA_PS2_SIZE16 : 0;
         dma[c].size          = (c & 4) ? 1 : 0;
         dma[c].transfer_mode = (c & 4) ? 0x0202 : 0x0101;
+        /* An EISA controller's extended mode after reset: the ISA widths,
+           8-bit counted in bytes on 0-3, 16-bit counted in words with the
+           address shifted on 5-7. */
+        dma[c].ext_mode      = (c & 4) ? 0x04 : 0x00;
     }
 
     dma_stat          = 0x00;
@@ -2818,7 +2864,7 @@ dma_channel_advance_legacy(int channel)
     if (dma_stat_adv_pend & (1 << channel)) {
         dma_stop_check(channel);
 
-        dma_c->cc--;
+        dma_c->cc -= dma_count_step(dma_c);
         if (dma_c->cc < 0) {
             if (dma_advanced && (dma_c->sg_status & 1) && !(dma_c->sg_status & 6))
                 dma_sg_next_addr(dma_c);
@@ -2916,7 +2962,7 @@ dma_channel_read_legacy(int channel)
 
     dma_stop_check(channel);
 
-    dma_c->cc--;
+    dma_c->cc -= dma_count_step(dma_c);
     if (dma_c->cc < 0) {
         if (dma_advanced && (dma_c->sg_status & 1) && !(dma_c->sg_status & 6))
             dma_sg_next_addr(dma_c);
@@ -3011,7 +3057,7 @@ dma_channel_write_legacy(int channel, uint16_t val)
 
     dma_stop_check(channel);
 
-    dma_c->cc--;
+    dma_c->cc -= dma_count_step(dma_c);
     if (dma_c->cc < 0) {
         if (dma_advanced && (dma_c->sg_status & 1) && !(dma_c->sg_status & 6))
             dma_sg_next_addr(dma_c);
@@ -3069,7 +3115,7 @@ dma_ps2_run(int channel)
                         dma_c->ac += 2;
                 }
 
-                dma_c->cc--;
+                dma_c->cc -= dma_count_step(dma_c);
             } while (dma_c->cc >= 0);
 
             dma_stat |= (1 << channel);
@@ -3097,7 +3143,7 @@ dma_ps2_run(int channel)
                         dma_c->ac += 2;
                 }
 
-                dma_c->cc--;
+                dma_c->cc -= dma_count_step(dma_c);
             } while (dma_c->cc >= 0);
 
             ps2_cache_clean();
@@ -3118,7 +3164,7 @@ dma_ps2_run(int channel)
                         dma_c->ac += 2;
                 }
 
-                dma_c->cc--;
+                dma_c->cc -= dma_count_step(dma_c);
             } while (dma_c->cc >= 0);
 
             dma_stat |= (1 << channel);
