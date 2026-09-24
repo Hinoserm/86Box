@@ -580,6 +580,16 @@ dma_group_disabled(int channel)
     return dma_eisa && ((dma_command[1] & 0x04) || (dma_m & 0x10));
 }
 
+/* Whether a channel is chaining: its base registers then hold the next
+   buffer, and what the CPU writes to the address, count and page registers
+   goes to them alone, leaving the current ones moving (82374EB 3.2.x,
+   Base and Current registers; 3.2.17). */
+static int
+dma_chaining(int channel)
+{
+    return dma_eisa && (dma_chain_mode[channel] & 0x04);
+}
+
 /* IRQ13 falls when neither a chain nor a scatter-gather list is waiting
    on the CPU. */
 static void
@@ -629,7 +639,8 @@ dma_addr_compat(dma_t *dev)
     dev->ext_addr = 0;
     dev->page_h   = 0;
     dev->ab &= 0x00ffffff;
-    dev->ac &= 0x00ffffff;
+    if (!dma_chaining((int) (dev - dma)))
+        dev->ac &= 0x00ffffff;
 }
 
 /* The bytes the next transfer moves: the channel's width, less at an odd
@@ -669,8 +680,6 @@ dma_count_take(dma_t *dev)
     dev->xfer_n = 0;
     return dma_count_dec(dev, n);
 }
-
-static int dma_chain_tc(int channel);
 
 /* Scatter-gather (82374EB 3.2.21-3.2.23, 6.6). A descriptor is a 32-bit
    memory address and a byte count, End of List in the count's top bit. The
@@ -772,12 +781,34 @@ dma_count_out(int channel)
         return dma_sg_expire(channel);
 
     dma_sw_req &= ~(1 << channel); /* TC clears the channel's software request */
-    if ((dma_c->mode & 0x10) || dma_chain_tc(channel)) { /*Auto-init, or the next link*/
+    dma_stat |= (1 << channel);
+
+    if (dma_chaining(channel)) {
+        /* A buffer has expired. Bit 4 chose how the CPU is told, so it can
+           program the next: TC, or IRQ13 in its place. With the base
+           registers marked programmed the channel moves on to them;
+           otherwise the chain ends and the channel masks itself. Chaining
+           stays on until the CPU turns it off (3.2.17, 3.2.18). */
+        int eop = !!(dma_chain_mode[channel] & 0x10);
+
+        if (!eop) {
+            dma_chain_int |= (1 << channel);
+            picint(1 << 13);
+        }
+        if (dma_chain_mode[channel] & 0x08) {
+            dma_chain_mode[channel] &= ~0x08;
+            dma_c->cc = dma_c->cb;
+            dma_c->ac = dma_c->ab;
+        } else
+            dma_m |= (1 << channel);
+        return eop;
+    }
+
+    if (dma_c->mode & 0x10) { /*Auto-init*/
         dma_c->cc = dma_c->cb;
         dma_c->ac = dma_c->ab;
     } else
         dma_m |= (1 << channel);
-    dma_stat |= (1 << channel);
     return 1;
 }
 
@@ -919,7 +950,8 @@ dma_ext_mode_write(uint16_t addr, uint8_t val, UNUSED(void *priv))
     if (addr == 0x4d6)
         channel |= 4;
 
-    dma[channel].ext_mode = val & 0x7c;
+    dma[channel].ext_mode   = val & 0x7c;
+    dma_chain_mode[channel] = 0; /* so does one to the extended mode register (3.2.17) */
 
     /* Only an EISA controller has stop registers for this to turn on. */
     if (dma_eisa && (val & 0x80))
@@ -1254,7 +1286,8 @@ dma_write_legacy(uint16_t addr, uint8_t val, UNUSED(void *priv))
                 dma[channel].ab = (dma[channel].ab & 0xffffff00 & dma_mask) | val;
             else
                 dma[channel].ab = (dma[channel].ab & 0xffff00ff & dma_mask) | (val << 8);
-            dma[channel].ac = dma[channel].ab;
+            if (!dma_chaining(channel))
+                dma[channel].ac = dma[channel].ab;
             return;
 
         case 1:
@@ -1266,7 +1299,8 @@ dma_write_legacy(uint16_t addr, uint8_t val, UNUSED(void *priv))
                 dma[channel].cb = (dma[channel].cb & 0xff00) | val;
             else
                 dma[channel].cb = (dma[channel].cb & 0x00ff) | (val << 8);
-            dma[channel].cc = dma[channel].cb;
+            if (!dma_chaining(channel))
+                dma[channel].cc = dma[channel].cb;
             return;
 
         case 8: /*Control register*/
@@ -1302,6 +1336,7 @@ dma_write_legacy(uint16_t addr, uint8_t val, UNUSED(void *priv))
         case 0xb: /*Mode*/
             channel           = (val & 3);
             dma[channel].mode = val;
+            dma_chain_mode[channel] = 0; /* an access to the mode register resets chaining (3.2.17) */
             if (dma_ps2.is_ps2) {
                 dma[channel].ps2_mode = 0;
                 dma[channel].size     = 0;
@@ -1666,7 +1701,8 @@ dma16_write(uint16_t addr, uint8_t val, UNUSED(void *priv))
                 else
                     dma[channel].ab = (dma[channel].ab & 0xfffe01ff & dma_mask) | (val << 9);
             }
-            dma[channel].ac = dma[channel].ab;
+            if (!dma_chaining(channel))
+                dma[channel].ac = dma[channel].ab;
             return;
 
         case 1:
@@ -1678,7 +1714,8 @@ dma16_write(uint16_t addr, uint8_t val, UNUSED(void *priv))
                 dma[channel].cb = (dma[channel].cb & 0xff00) | val;
             else
                 dma[channel].cb = (dma[channel].cb & 0x00ff) | (val << 8);
-            dma[channel].cc = dma[channel].cb;
+            if (!dma_chaining(channel))
+                dma[channel].cc = dma[channel].cb;
             return;
 
         case 8: /*Control register*/
@@ -1708,6 +1745,7 @@ dma16_write(uint16_t addr, uint8_t val, UNUSED(void *priv))
         case 0xb: /*Mode*/
             channel           = (val & 3) + 4;
             dma[channel].mode = val;
+            dma_chain_mode[channel] = 0; /* an access to the mode register resets chaining (3.2.17) */
             if (dma_ps2.is_ps2) {
                 dma[channel].ps2_mode = DMA_PS2_SIZE16;
                 dma[channel].size     = DMA_PS2_SIZE16;
@@ -1789,16 +1827,19 @@ dma_page_write(uint16_t addr, uint8_t val, UNUSED(void *priv))
         if (dma_addr_shifted(&dma[addr]) && (addr != 4)) {
             dma[addr].page = val & 0xfe;
             dma[addr].ab   = (dma[addr].ab & 0xff01ffff & dma_mask) | (dma[addr].page << 16);
-            dma[addr].ac   = (dma[addr].ac & 0xff01ffff & dma_mask) | (dma[addr].page << 16);
+            if (!dma_chaining(addr))
+                dma[addr].ac = (dma[addr].ac & 0xff01ffff & dma_mask) | (dma[addr].page << 16);
         } else if (addr > 4) {
             /* Not shifted, the page is A16-A23 whole. */
             dma[addr].page = val;
             dma[addr].ab   = (dma[addr].ab & 0xff00ffff & dma_mask) | (dma[addr].page << 16);
-            dma[addr].ac   = (dma[addr].ac & 0xff00ffff & dma_mask) | (dma[addr].page << 16);
+            if (!dma_chaining(addr))
+                dma[addr].ac = (dma[addr].ac & 0xff00ffff & dma_mask) | (dma[addr].page << 16);
         } else {
             dma[addr].page = dma_page_is_xt() ? (val & 0x0f) : val;
             dma[addr].ab   = (dma[addr].ab & 0xff00ffff & dma_mask) | (dma[addr].page << 16);
-            dma[addr].ac   = (dma[addr].ac & 0xff00ffff & dma_mask) | (dma[addr].page << 16);
+            if (!dma_chaining(addr))
+                dma[addr].ac = (dma[addr].ac & 0xff00ffff & dma_mask) | (dma[addr].page << 16);
         }
     }
 }
@@ -1875,7 +1916,8 @@ dma_high_page_write(uint16_t addr, uint8_t val, UNUSED(void *priv))
             dma[addr].ext_addr = 1;
 
         dma[addr].ab = ((dma[addr].ab & 0xffffff) | (dma[addr].page_h << 24)) & dma_mask;
-        dma[addr].ac = ((dma[addr].ac & 0xffffff) | (dma[addr].page_h << 24)) & dma_mask;
+        if (!dma_chaining(addr))
+            dma[addr].ac = ((dma[addr].ac & 0xffffff) | (dma[addr].page_h << 24)) & dma_mask;
     }
 }
 
@@ -2076,7 +2118,8 @@ dma_high_count_write(uint16_t addr, uint8_t val, UNUSED(void *priv))
         return;
 
     dma[channel].cb = (dma[channel].cb & 0x00ffff) | ((uint32_t) val << 16);
-    dma[channel].cc = (int) dma[channel].cb;
+    if (!dma_chaining(channel))
+        dma[channel].cc = (int) dma[channel].cb;
 }
 
 /* 040Ah and 04D4h, written: the chaining mode of one channel, chosen by
@@ -2451,34 +2494,6 @@ dma_stop_check(int channel)
         if ((last & 0x00fffffc) == (stop & 0x00fffffc))
             dma_m |= (1 << channel);
     }
-}
-
-/* EISA buffer chaining. With it on, the base registers hold the next buffer
-   rather than a copy of this one, so reaching terminal count means moving on
-   to it instead of stopping. The CPU is told, by IRQ13 or by TC as bit 4
-   chose, so it can program the buffer after that. Returns whether the
-   channel carries on. */
-static int
-dma_chain_tc(int channel)
-{
-    if (!(dma_chain_mode[channel] & 0x04))
-        return 0;
-
-    if (!(dma_chain_mode[channel] & 0x08)) {
-        /* Nobody said the next buffer was ready, so the chain ends here and
-           the channel masks itself the ordinary way. */
-        dma_chain_mode[channel] &= ~0x04;
-        return 0;
-    }
-
-    dma_chain_mode[channel] &= ~0x08;
-
-    if (!(dma_chain_mode[channel] & 0x10)) {
-        dma_chain_int |= (1 << channel);
-        picint(1 << 13);
-    }
-
-    return 1;
 }
 
 static int dma_channel_read_only_legacy(int channel);
@@ -3189,12 +3204,12 @@ dma_channel_write_legacy(int channel, uint16_t val)
 
     dma_stop_check(channel);
 
-    sg = dma_c->sg_status & DMA_SG_ACTIVE;
+    sg = (dma_c->sg_status & DMA_SG_ACTIVE) || dma_chaining(channel);
     dma_c->cc -= dma_count_take(dma_c);
     if (dma_c->cc < 0)
         tc = dma_count_out(channel);
 
-    /* A scatter-gather list ends with EOP only if it chose EOP. */
+    /* A scatter-gather list or a chain gives EOP only where it chose EOP. */
     if (sg ? tc : (dma_m & (1 << channel)))
         return DMA_OVER;
 
