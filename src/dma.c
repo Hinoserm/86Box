@@ -2581,8 +2581,18 @@ dma_stop_check(int channel)
 
     stop = dma_stop[channel][0] | (dma_stop[channel][1] << 8) | (dma_stop[channel][2] << 16);
 
-    if ((dma[channel].ac & 0x00fffffc) == (stop & 0x00fffffc))
-        dma_m |= (1 << channel);
+    /* "The last address transferred before the channel is masked is the
+       first address that matches the Stop register" (82374EB, Table 18):
+       the address just transferred, not the next one, which has already
+       been counted to. */
+    {
+        const dma_t *dma_c = &dma[channel];
+        int          n     = dma_c->xfer_n ? dma_c->xfer_n : (dma_c->transfer_mode >> 8);
+        uint32_t     last  = (dma_c->mode & 0x20) ? (dma_c->ac + n) : (dma_c->ac - n);
+
+        if ((last & 0x00fffffc) == (stop & 0x00fffffc))
+            dma_m |= (1 << channel);
+    }
 }
 
 /* EISA buffer chaining. With it on, the base registers hold the next buffer
