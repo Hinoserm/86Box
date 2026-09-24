@@ -45,6 +45,7 @@ static int      dma_wp[2];
 static uint8_t  dma_stat;
 static uint8_t  dma_stat_rq;
 static uint8_t  dma_stat_rq_pc;
+static uint8_t  dma_sw_req; /* the Request register: software requests, beside the DREQ lines in dma_stat_rq_pc */
 static uint8_t  dma_stat_adv_pend;
 static uint8_t  dma_command[2];
 static uint8_t  dma_req_is_soft;
@@ -556,6 +557,39 @@ dma_addr_shifted(const dma_t *dev)
     return dma_ext_size(dev) == 0x01;
 }
 
+/* Whether a channel's controller is disabled. On an EISA controller the
+   first controller hangs off channel 4 of the second, cascaded: disabling
+   the second or masking channel 4 stops 0-3 as well (82374EB 3.2.1, 3.2.5). */
+static int
+dma_group_disabled(int channel)
+{
+    if (channel >= 4)
+        return !!(dma_command[1] & 0x04);
+    if (dma_command[0] & 0x04)
+        return 1;
+    return dma_eisa && ((dma_command[1] & 0x04) || (dma_m & 0x10));
+}
+
+/* Master Clear on an EISA controller, one group: what the data book lists
+   beyond the 8237's command, status, request, flip-flop and mask -- mode
+   (channel 4 back to cascade), address, count and high count, low and high
+   page, chaining mode, and compatibility addressing. The extended mode and
+   stop registers are not affected (82374EB 3.2.x, 6.x). */
+static void
+dma_eisa_master_clear(int first)
+{
+    for (int c = first; c < first + 4; c++) {
+        dma[c].mode   = (c == 4) ? 0xc0 : 0x00;
+        dma[c].ab     = dma[c].ac = 0;
+        dma[c].cb     = 0;
+        dma[c].cc     = 0;
+        dma[c].page   = dma[c].page_l = dma[c].page_h = 0;
+        dma[c].xfer_n = 0;
+        dma_chain_mode[c] = 0;
+        dma[c].ext_addr   = 0;
+    }
+}
+
 /* ADDRESS COMPATIBILITY MODE (82374EB 6.7.1). Writing any of a channel's
    lower three address bytes -- the address register or the low page --
    clears its high page and puts it in compatibility mode, where the
@@ -644,6 +678,18 @@ dma_block_transfer(int channel)
         bit16 = !!(dma_transfer_size(&(dma[channel])) == 2);
 
     dma_req_is_soft = 1;
+    /* A block verify moves nothing but runs to terminal count, as the
+       others do (82374EB Table 19). */
+    if ((dma[channel].mode & 0x8c) == 0x80) {
+        for (uint32_t i = 0; i < 0x1000000; i++) {
+            int ret = dma_channel_write(channel, 0);
+
+            if ((ret == DMA_NODATA) || (ret & DMA_OVER))
+                break;
+        }
+        dma_req_is_soft = 0;
+        return;
+    }
     for (uint32_t i = 0; (i <= dma[channel].cb) && (i < 65536); i++) {
         if ((dma[channel].mode & 0x8c) == 0x84) {
             if (bit16)
@@ -1212,7 +1258,7 @@ dma_read_legacy(uint16_t addr, UNUSED(void *priv))
                 dma_stat &= ~0x0f;
                 dma_stat_rq &= ~0x0f;
             } else {
-                ret = (dma_stat_rq_pc & 0x0f) << 4;
+                ret = ((dma_stat_rq_pc | dma_sw_req) & 0x0f) << 4;
                 ret |= dma_stat & 0x0f;
                 dma_stat &= ~0x0f;
             }
@@ -1220,6 +1266,11 @@ dma_read_legacy(uint16_t addr, UNUSED(void *priv))
 
         case 0xd: /*Temporary register*/
             ret = 0x00;
+            break;
+
+        case 0xf: /*Write All Mask Bits: readable on EISA, as the mask now*/
+            if (dma_eisa)
+                ret = dma_m & 0x0f;
             break;
 
         default:
@@ -1282,14 +1333,15 @@ dma_write_legacy(uint16_t addr, uint8_t val, UNUSED(void *priv))
         case 9: /*Request register */
             channel = (val & 3);
             if (val & 4) {
-                dma_stat_rq_pc |= (1 << channel);
-                if ((channel == 0) && (dma_command[0] & 0x01)) {
+                dma_sw_req |= (1 << channel);
+                /* The ESC has no memory-to-memory transfer (82374EB 3.2.1). */
+                if ((channel == 0) && (dma_command[0] & 0x01) && !dma_eisa) {
                     dma_log("Memory to memory transfer start\n");
                     dma_mem_to_mem_transfer();
                 } else
                     dma_block_transfer(channel);
             } else
-                dma_stat_rq_pc &= ~(1 << channel);
+                dma_sw_req &= ~(1 << channel);
             break;
 
         case 0xa: /*Mask*/
@@ -1322,11 +1374,17 @@ dma_write_legacy(uint16_t addr, uint8_t val, UNUSED(void *priv))
             return;
 
         case 0xd: /*Master clear*/
+            /* The Request register, not the DREQ lines a device holds. */
             dma_wp[0] = 0;
             for (int c = 0; c < 4; c++)
                 dma_addr_compat(&dma[c]);
             dma_m |= 0xf;
-            dma_stat_rq_pc &= ~0x0f;
+            dma_sw_req &= ~0x0f;
+            if (dma_eisa) {
+                dma_command[0] = 0;
+                dma_stat &= ~0x0f;
+                dma_eisa_master_clear(0);
+            }
             return;
 
         case 0xe: /*Clear mask*/
@@ -1608,10 +1666,15 @@ dma16_read(uint16_t addr, UNUSED(void *priv))
                 dma_stat &= ~0xf0;
                 dma_stat_rq &= ~0xf0;
             } else {
-                ret = dma_stat_rq_pc & 0xf0;
+                ret = (dma_stat_rq_pc | dma_sw_req) & 0xf0;
                 ret |= dma_stat >> 4;
                 dma_stat &= ~0xf0;
             }
+            break;
+
+        case 0xf: /*Write All Mask Bits: readable on EISA, as the mask now*/
+            if (dma_eisa)
+                ret = dma_m >> 4;
             break;
 
         default:
@@ -1672,15 +1735,19 @@ dma16_write(uint16_t addr, uint8_t val, UNUSED(void *priv))
             return;
 
         case 8: /*Control register*/
+            /* The second controller's command register (0D0h); on EISA its
+               disable bit stops the first controller too (dma_group_disabled). */
+            if (dma_eisa)
+                dma_command[1] = val;
             return;
 
         case 9: /*Request register */
             channel = (val & 3) + 4;
             if (val & 4) {
-                dma_stat_rq_pc |= (1 << channel);
+                dma_sw_req |= (1 << channel);
                 dma_block_transfer(channel);
             } else
-                dma_stat_rq_pc &= ~(1 << channel);
+                dma_sw_req &= ~(1 << channel);
             break;
 
         case 0xa: /*Mask*/
@@ -1717,7 +1784,12 @@ dma16_write(uint16_t addr, uint8_t val, UNUSED(void *priv))
             for (int c = 4; c < 8; c++)
                 dma_addr_compat(&dma[c]);
             dma_m |= 0xf0;
-            dma_stat_rq_pc &= ~0xf0;
+            dma_sw_req &= ~0xf0;
+            if (dma_eisa) {
+                dma_command[1] = 0;
+                dma_stat &= ~0xf0;
+                dma_eisa_master_clear(4);
+            }
             return;
 
         case 0xe: /*Clear mask*/
@@ -1930,6 +2002,7 @@ dma_reset_legacy(void)
     dma_stat          = 0x00;
     dma_stat_rq       = 0x00;
     dma_stat_rq_pc    = 0x00;
+    dma_sw_req        = 0x00;
     dma_stat_adv_pend = 0x00;
     dma_req_is_soft   = 0;
     dma_advanced      = 0;
@@ -1952,6 +2025,10 @@ dma_reset_legacy(void)
     if (dma_eisa) {
         dma_advanced = 1;
         dma_mask     = 0xffffffff;
+        /* Reset sets the masks and puts channel 4 in cascade (82374EB
+           3.2.2, 3.2.5). */
+        dma_m        = 0xff;
+        dma[4].mode  = 0xc0;
     }
 
     dma_at = is286;
@@ -2853,7 +2930,7 @@ dma_channel_32_ready(int channel, int want)
 {
     const dma_t *dma_c = &dma[channel];
 
-    if (dma_command[(channel < 4) ? 0 : 1] & 0x04)
+    if (dma_group_disabled(channel))
         return 0;
     if (!(dma_e & (1 << channel)))
         return 0;
@@ -2884,6 +2961,7 @@ dma_channel_32_finish(int channel, int n)
             dma_sg_next_addr(dma_c);
         else {
             tc = 1;
+            dma_sw_req &= ~(1 << channel); /* TC clears the channel's software request */
             if ((dma_c->mode & 0x10) || dma_chain_tc(channel)) {
                 dma_c->cc = dma_c->cb;
                 dma_c->ac = dma_c->ab;
@@ -2961,13 +3039,8 @@ dma_channel_readable_legacy(int channel)
     dma_t   *dma_c = &dma[channel];
     int      ret = 1;
 
-    if (channel < 4) {
-        if (dma_command[0] & 0x04)
-            ret = 0;
-    } else {
-        if (dma_command[1] & 0x04)
-            ret = 0;
-    }
+    if (dma_group_disabled(channel))
+        ret = 0;
 
     if (!(dma_e & (1 << channel)))
         ret = 0;
@@ -2985,13 +3058,8 @@ dma_channel_writable_legacy(int channel)
     dma_t   *dma_c = &dma[channel];
     int      ret = 1;
 
-    if (channel < 4) {
-        if (dma_command[0] & 0x04)
-            ret = 0;
-    } else {
-        if (dma_command[1] & 0x04)
-            ret = 0;
-    }
+    if (dma_group_disabled(channel))
+        ret = 0;
 
     if (!(dma_e & (1 << channel)))
         ret = 0;
@@ -3009,13 +3077,8 @@ dma_channel_read_only_legacy(int channel)
     dma_t   *dma_c = &dma[channel];
     uint16_t temp;
 
-    if (channel < 4) {
-        if (dma_command[0] & 0x04)
-            return (DMA_NODATA);
-    } else {
-        if (dma_command[1] & 0x04)
-            return (DMA_NODATA);
-    }
+    if (dma_group_disabled(channel))
+        return (DMA_NODATA);
 
     if (!(dma_e & (1 << channel)))
         return (DMA_NODATA);
@@ -3100,6 +3163,7 @@ dma_channel_advance_legacy(int channel)
                 dma_sg_next_addr(dma_c);
             else {
                 tc = 1;
+                dma_sw_req &= ~(1 << channel); /* TC clears the channel's software request */
                 if ((dma_c->mode & 0x10) || dma_chain_tc(channel)) { /*Auto-init, or the next link*/
                     dma_c->cc = dma_c->cb;
                     dma_c->ac = dma_c->ab;
@@ -3129,13 +3193,8 @@ dma_channel_read_legacy(int channel)
     uint16_t temp;
     int      tc = 0;
 
-    if (channel < 4) {
-        if (dma_command[0] & 0x04)
-            return (DMA_NODATA);
-    } else {
-        if (dma_command[1] & 0x04)
-            return (DMA_NODATA);
-    }
+    if (dma_group_disabled(channel))
+        return (DMA_NODATA);
 
     if (!(dma_e & (1 << channel)))
         return (DMA_NODATA);
@@ -3209,6 +3268,7 @@ dma_channel_read_legacy(int channel)
             dma_sg_next_addr(dma_c);
         else {
             tc = 1;
+            dma_sw_req &= ~(1 << channel); /* TC clears the channel's software request */
             if ((dma_c->mode & 0x10) || dma_chain_tc(channel)) { /*Auto-init, or the next link*/
                 dma_c->cc = dma_c->cb;
                 dma_c->ac = dma_c->ab;
@@ -3236,13 +3296,8 @@ dma_channel_write_legacy(int channel, uint16_t val)
     dma_t *dma_c = &dma[channel];
     int    type;
 
-    if (channel < 4) {
-        if (dma_command[0] & 0x04)
-            return (DMA_NODATA);
-    } else {
-        if (dma_command[1] & 0x04)
-            return (DMA_NODATA);
-    }
+    if (dma_group_disabled(channel))
+        return (DMA_NODATA);
 
     if (!(dma_e & (1 << channel)))
         return (DMA_NODATA);
@@ -3318,6 +3373,7 @@ dma_channel_write_legacy(int channel, uint16_t val)
         if (dma_advanced && (dma_c->sg_status & 1) && !(dma_c->sg_status & 6))
             dma_sg_next_addr(dma_c);
         else {
+            dma_sw_req &= ~(1 << channel); /* TC clears the channel's software request */
             if ((dma_c->mode & 0x10) || dma_chain_tc(channel)) { /*Auto-init, or the next link*/
                 dma_c->cc = dma_c->cb;
                 dma_c->ac = dma_c->ab;
