@@ -50,9 +50,7 @@ typedef struct dma_t {
     uint8_t  command;
     uint8_t  ps2_mode;
     uint8_t  arb_level;
-    uint8_t  sg_command;
     uint8_t  sg_status;
-    uint8_t  ptr0;
     uint8_t  enabled;
     uint8_t  ext_mode;
     uint8_t  page_l;
@@ -63,15 +61,11 @@ typedef struct dma_t {
     uint16_t base;
     uint16_t transfer_mode;
     uint32_t ptr;
-    uint32_t ptr_cur;
-    uint32_t addr;
     uint32_t ab;
     uint32_t ac;
     int      cc;
     int      wp;
     int      size;
-    int      count;
-    int      eot;
     int      xfer_n; /* EISA: bytes the last transfer moved, for a deferred advance */
 } dma_t;
 

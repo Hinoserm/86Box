@@ -55,8 +55,18 @@ static uint8_t  dma_ibm5140;
 static uint8_t  dma_ibm5140_diag;
 static uint8_t  dma_buffer[65536];
 static uint16_t dma_sg_base;
+/* Scatter-gather status, per channel (82374EB 3.2.22). The data book's
+   table leaves bit 1 reserved, but its text has a Terminate bit set by Stop
+   and by the end of the list; bit 1 is where it is kept. */
+#define DMA_SG_ACTIVE 0x01
+#define DMA_SG_TERM   0x02
+#define DMA_SG_CUR    0x04
+#define DMA_SG_BASE   0x08
+#define DMA_SG_EOP    0x20
+#define DMA_SG_NNL    0x80
+static uint8_t  dma_sg_int; /* channels whose list ended with IRQ13 */
 /* How much of a scatter-gather descriptor is the byte count: sixteen bits
-   on the PCI-ISA bridges, twenty-four on an EISA one. */
+   on the PCI-ISA bridges, twenty-four on an EISA one (82374EB 6.6). */
 static uint32_t dma_sg_count_mask = 0x0000fffe;
 /* EISA buffer chaining and the ring buffer stop registers. */
 static uint8_t  dma_chain_mode[8];
@@ -570,6 +580,15 @@ dma_group_disabled(int channel)
     return dma_eisa && ((dma_command[1] & 0x04) || (dma_m & 0x10));
 }
 
+/* IRQ13 falls when neither a chain nor a scatter-gather list is waiting
+   on the CPU. */
+static void
+dma_irq13_update(void)
+{
+    if (!dma_chain_int && !dma_sg_int)
+        picintc(1 << 13);
+}
+
 /* Master Clear on an EISA controller, one group: what the data book lists
    beyond the 8237's command, status, request, flip-flop and mask -- mode
    (channel 4 back to cascade), address, count and high count, low and high
@@ -587,7 +606,12 @@ dma_eisa_master_clear(int first)
         dma[c].xfer_n = 0;
         dma_chain_mode[c] = 0;
         dma[c].ext_addr   = 0;
+        /* Scatter-gather: not active, Next Link Null clear, IRQ13 chosen
+           for the end of the list (82374EB 3.2.21, 3.2.22). */
+        dma[c].sg_status &= ~(DMA_SG_ACTIVE | DMA_SG_EOP | DMA_SG_NNL);
+        dma_sg_int &= ~(1 << c);
     }
+    dma_irq13_update();
 }
 
 /* ADDRESS COMPATIBILITY MODE (82374EB 6.7.1). Writing any of a channel's
@@ -646,27 +670,115 @@ dma_count_take(dma_t *dev)
     return dma_count_dec(dev, n);
 }
 
-static void
-dma_sg_next_addr(dma_t *dev)
-{
-    int ts = dma_transfer_size(dev);
+static int dma_chain_tc(int channel);
 
-    dma_bm_read(dev->ptr_cur, (uint8_t *) &(dev->addr), 4, ts);
-    dma_bm_read(dev->ptr_cur + 4, (uint8_t *) &(dev->count), 4, ts);
-    dma_log("DMA S/G DWORDs: %08X %08X\n", dev->addr, dev->count);
-    dev->eot = dev->count >> 31;
-    dev->count &= dma_sg_count_mask;
-    dev->cb = dev->count;
-    dev->cc = dev->count;
-    if (!dev->count)
-        dev->count = (dma_sg_count_mask & 0x00ff0000) ? 16777216 : 65536;
-    if (ts == 2)
-        dev->addr &= 0xfffffffe;
-    dev->ab   = dev->addr & dma_mask;
-    dev->ac   = dev->addr & dma_mask;
-    dev->page = dev->page_l = (dev->ac >> 16) & 0xff;
-    dev->page_h             = (dev->ac >> 24) & 0xff;
-    dev->ptr_cur += 8;
+/* Scatter-gather (82374EB 3.2.21-3.2.23, 6.6). A descriptor is a 32-bit
+   memory address and a byte count, End of List in the count's top bit. The
+   channel's own registers hold the buffers: the base set a prefetched
+   reserve, the current set the one moving. */
+
+/* Prefetch the descriptor at the pointer into the base registers. The
+   pointer steps on by 8, except past a descriptor with EOL, which sets Next
+   Link Null instead and ends the fetching. */
+static void
+dma_sg_fetch(dma_t *dev)
+{
+    uint32_t sgd[2];
+    uint32_t bytes;
+    uint32_t units;
+
+    if (dev->sg_status & DMA_SG_NNL)
+        return;
+
+    dma_bm_read(dev->ptr & ~3, (uint8_t *) sgd, 8, 4);
+    bytes = sgd[1] & dma_sg_count_mask;
+    if (!bytes)
+        bytes = (dma_sg_count_mask | 1) + 1;
+    /* The count register counts what the channel counts: bytes, or words
+       on a channel counting in words. */
+    units = (dma_eisa && (dma_ext_size(dev) >= 0x02)) ? bytes : (bytes / dma_transfer_size(dev));
+    if (!units)
+        units = 1;
+
+    dev->ab = sgd[0] & dma_mask;
+    dev->cb = units - 1;
+    dev->sg_status |= DMA_SG_BASE;
+    if (sgd[1] & 0x80000000)
+        dev->sg_status |= DMA_SG_NNL;
+    else {
+        dev->sg_status &= ~DMA_SG_NNL;
+        dev->ptr += 8;
+    }
+    dma_log("DMA S/G fetch: %08X %08X\n", sgd[0], sgd[1]);
+}
+
+/* A transfer on an active channel whose current buffer has run out first
+   moves the base buffer in, then prefetches the one after it (6.6 step 8:
+   not before the next transfer starts). */
+static void
+dma_sg_load(dma_t *dev)
+{
+    if ((dev->sg_status & (DMA_SG_ACTIVE | DMA_SG_CUR | DMA_SG_BASE)) != (DMA_SG_ACTIVE | DMA_SG_BASE))
+        return;
+
+    dev->ac     = dev->ab;
+    dev->cc     = (int) dev->cb;
+    dev->page   = dev->page_l = (dev->ac >> 16) & 0xff;
+    dev->page_h = (dev->ac >> 24) & 0xff;
+    dev->sg_status = (dev->sg_status & ~DMA_SG_BASE) | DMA_SG_CUR;
+    dma_sg_fetch(dev);
+}
+
+/* The list is over, by Stop or by the last buffer: Terminate, not active,
+   the channel masked, and EOP to the device or IRQ13 to the CPU as the
+   command register chose. Returns whether it is EOP. */
+static int
+dma_sg_end(int channel)
+{
+    dma_t *dev = &dma[channel];
+
+    dev->sg_status = (dev->sg_status & ~DMA_SG_ACTIVE) | DMA_SG_TERM;
+    dma_m |= (1 << channel);
+    dma_sw_req &= ~(1 << channel);
+    if (dev->sg_status & DMA_SG_EOP)
+        return 1;
+    dma_sg_int |= (1 << channel);
+    picint(1 << 13);
+    return 0;
+}
+
+/* The current buffer's count has run out. With a buffer waiting in the
+   base registers the channel carries on; after the last one the list ends
+   at terminal count (6.6 step 9). Returns whether TC goes to the device. */
+static int
+dma_sg_expire(int channel)
+{
+    dma_t *dev = &dma[channel];
+
+    dev->sg_status &= ~DMA_SG_CUR;
+    if (dev->sg_status & DMA_SG_BASE)
+        return 0;
+    dma_stat |= (1 << channel);
+    return dma_sg_end(channel);
+}
+
+/* The count has gone past zero. Returns whether TC goes to the device. */
+static int
+dma_count_out(int channel)
+{
+    dma_t *dma_c = &dma[channel];
+
+    if (dma_c->sg_status & DMA_SG_ACTIVE)
+        return dma_sg_expire(channel);
+
+    dma_sw_req &= ~(1 << channel); /* TC clears the channel's software request */
+    if ((dma_c->mode & 0x10) || dma_chain_tc(channel)) { /*Auto-init, or the next link*/
+        dma_c->cc = dma_c->cb;
+        dma_c->ac = dma_c->ab;
+    } else
+        dma_m |= (1 << channel);
+    dma_stat |= (1 << channel);
+    return 1;
 }
 
 static void
@@ -727,234 +839,74 @@ dma_mem_to_mem_transfer(void)
     dma_req_is_soft = 0;
 }
 
+/* The S-G Command register (3.2.21). Bit 6 lets bit 7 choose EOP (1) or
+   IRQ13 (0) for the end of the list; bits 1:0 are the command. */
 static void
-dma_sg_write(uint16_t port, uint8_t val, void *priv)
+dma_sg_command(int channel, uint8_t val)
 {
-    dma_t *dev = (dma_t *) priv;
+    dma_t *dev = &dma[channel];
+
+    dma_log("DMA S/G Cmd   : ch %i val = %02X\n", channel, val);
+
+    if (val & 0x40)
+        dev->sg_status = (dev->sg_status & ~DMA_SG_EOP) | ((val & 0x80) ? DMA_SG_EOP : 0);
+
+    switch (val & 0x03) {
+        case 0x01:
+            /* Start: active, both buffers empty, not terminated, Next Link
+               Null clear, and the first descriptor prefetched. */
+            dev->sg_status = (dev->sg_status & DMA_SG_EOP) | DMA_SG_ACTIVE;
+            dma_sg_int &= ~(1 << channel);
+            dma_irq13_update();
+            dma_sg_fetch(dev);
+            break;
+        case 0x02:
+            /* Stop: halts at once, Terminate and the channel's mask set. */
+            if (dev->sg_status & DMA_SG_ACTIVE)
+                (void) dma_sg_end(channel);
+            else {
+                dev->sg_status |= DMA_SG_TERM;
+                dma_m |= (1 << channel);
+            }
+            break;
+
+        default:
+            break;
+    }
+}
+
+/* The S-G registers, offsets from the relocatable base: 10h-17h command
+   (write only), 18h-1Fh status (read only), 20h-3Fh the descriptor table
+   pointers, four bytes a channel. Wider accesses come here a byte at a
+   time, each to its own channel. */
+static void
+dma_sg_write(uint16_t port, uint8_t val, UNUSED(void *priv))
+{
+    uint8_t reg = port & 0xff;
 
     dma_log("DMA S/G BYTE  write: %04X       %02X\n", port, val);
 
-    port &= 0xff;
+    if (reg >= 0x20) {
+        dma_t *dev   = &dma[(reg >> 2) & 7];
+        int    shift = (reg & 3) * 8;
 
-    if (port < 0x20)
-        port &= 0xf8;
-    else
-        port &= 0xe3;
-
-    switch (port) {
-        case 0x00:
-            dma_log("DMA S/G Cmd   : val = %02X, old = %02X\n", val, dev->sg_command);
-            if ((val & 1) && !(dev->sg_command & 1)) { /*Start*/
-#ifdef ENABLE_DMA_LOG
-                dma_log("DMA S/G start\n");
-#endif
-                dev->ptr_cur = dev->ptr;
-                dma_sg_next_addr(dev);
-                dev->sg_status = (dev->sg_status & 0xf7) | 0x01;
-            }
-            if (!(val & 1) && (dev->sg_command & 1)) { /*Stop*/
-#ifdef ENABLE_DMA_LOG
-                dma_log("DMA S/G stop\n");
-#endif
-                dev->sg_status &= ~0x81;
-            }
-
-            dev->sg_command = val;
-            break;
-        case 0x20:
-            dev->ptr = (dev->ptr & 0xffffff00) | (val & 0xfc);
-            dev->ptr %= (mem_size * 1024);
-            dev->ptr0 = val;
-            break;
-        case 0x21:
-            dev->ptr = (dev->ptr & 0xffff00fc) | (val << 8);
-            dev->ptr %= (mem_size * 1024);
-            break;
-        case 0x22:
-            dev->ptr = (dev->ptr & 0xff00fffc) | (val << 16);
-            dev->ptr %= (mem_size * 1024);
-            break;
-        case 0x23:
-            dev->ptr = (dev->ptr & 0x00fffffc) | (val << 24);
-            dev->ptr %= (mem_size * 1024);
-            break;
-
-        default:
-            break;
-    }
-}
-
-static void
-dma_sg_writew(uint16_t port, uint16_t val, void *priv)
-{
-    dma_t *dev = (dma_t *) priv;
-
-    dma_log("DMA S/G WORD  write: %04X     %04X\n", port, val);
-
-    port &= 0xff;
-
-    if (port < 0x20)
-        port &= 0xf8;
-    else
-        port &= 0xe3;
-
-    switch (port) {
-        case 0x00:
-            dma_sg_write(port, val & 0xff, priv);
-            break;
-        case 0x20:
-            dev->ptr = (dev->ptr & 0xffff0000) | (val & 0xfffc);
-            dev->ptr %= (mem_size * 1024);
-            dev->ptr0 = val & 0xff;
-            break;
-        case 0x22:
-            dev->ptr = (dev->ptr & 0x0000fffc) | (val << 16);
-            dev->ptr %= (mem_size * 1024);
-            break;
-
-        default:
-            break;
-    }
-}
-
-static void
-dma_sg_writel(uint16_t port, uint32_t val, void *priv)
-{
-    dma_t *dev = (dma_t *) priv;
-
-    dma_log("DMA S/G DWORD write: %04X %08X\n", port, val);
-
-    port &= 0xff;
-
-    if (port < 0x20)
-        port &= 0xf8;
-    else
-        port &= 0xe3;
-
-    switch (port) {
-        case 0x00:
-            dma_sg_write(port, val & 0xff, priv);
-            break;
-        case 0x20:
-            dev->ptr = (val & 0xfffffffc);
-            dev->ptr %= (mem_size * 1024);
-            dev->ptr0 = val & 0xff;
-            break;
-
-        default:
-            break;
-    }
+        dev->ptr = (dev->ptr & ~(0xffu << shift)) | ((uint32_t) val << shift);
+    } else if (reg < 0x18)
+        dma_sg_command(reg & 7, val);
 }
 
 static uint8_t
-dma_sg_read(uint16_t port, void *priv)
+dma_sg_read(uint16_t port, UNUSED(void *priv))
 {
-    const dma_t *dev = (dma_t *) priv;
-
+    uint8_t reg = port & 0xff;
     uint8_t ret = 0xff;
 
-    port &= 0xff;
-
-    if (port < 0x20)
-        port &= 0xf8;
-    else
-        port &= 0xe3;
-
-    switch (port) {
-        case 0x08:
-            ret = (dev->sg_status & 0x01);
-            if (dev->eot)
-                ret |= 0x80;
-            if ((dev->sg_command & 0xc0) == 0x40)
-                ret |= 0x20;
-            if (dev->ab != 0x00000000)
-                ret |= 0x08;
-            if (dev->ac != 0x00000000)
-                ret |= 0x04;
-            break;
-        case 0x20:
-            ret = dev->ptr0;
-            break;
-        case 0x21:
-            ret = dev->ptr >> 8;
-            break;
-        case 0x22:
-            ret = dev->ptr >> 16;
-            break;
-        case 0x23:
-            ret = dev->ptr >> 24;
-            break;
-
-        default:
-            break;
-    }
+    if (reg >= 0x20)
+        ret = dma[(reg >> 2) & 7].ptr >> ((reg & 3) * 8);
+    else if (reg >= 0x18)
+        ret = dma[reg & 7].sg_status;
 
     dma_log("DMA S/G BYTE  read : %04X       %02X\n", port, ret);
-
-    return ret;
-}
-
-static uint16_t
-dma_sg_readw(uint16_t port, void *priv)
-{
-    const dma_t *dev = (dma_t *) priv;
-
-    uint16_t ret = 0xffff;
-
-    port &= 0xff;
-
-    if (port < 0x20)
-        port &= 0xf8;
-    else
-        port &= 0xe3;
-
-    switch (port) {
-        case 0x08:
-            ret = (uint16_t) dma_sg_read(port, priv);
-            break;
-        case 0x20:
-            ret = dev->ptr0 | (dev->ptr & 0xff00);
-            break;
-        case 0x22:
-            ret = dev->ptr >> 16;
-            break;
-
-        default:
-            break;
-    }
-
-    dma_log("DMA S/G WORD  read : %04X     %04X\n", port, ret);
-
-    return ret;
-}
-
-static uint32_t
-dma_sg_readl(uint16_t port, void *priv)
-{
-    const dma_t *dev = (dma_t *) priv;
-
-    uint32_t ret = 0xffffffff;
-
-    port &= 0xff;
-
-    if (port < 0x20)
-        port &= 0xf8;
-    else
-        port &= 0xe3;
-
-    switch (port) {
-        case 0x08:
-            ret = (uint32_t) dma_sg_read(port, priv);
-            break;
-        case 0x20:
-            ret = dev->ptr0 | (dev->ptr & 0xffffff00);
-            break;
-
-        default:
-            break;
-    }
-
-    dma_log("DMA S/G DWORD read : %04X %08X\n", port, ret);
 
     return ret;
 }
@@ -1008,12 +960,7 @@ dma_sg_int_status_read(UNUSED(uint16_t addr), UNUSED(void *priv))
 {
     uint8_t ret = 0x00;
 
-    for (uint8_t i = 0; i < 8; i++) {
-        if (i != 4)
-            ret |= (!!(dma[i].sg_status & 8)) << i;
-    }
-
-    ret |= dma_chain_int;
+    ret |= dma_sg_int | dma_chain_int;
 
     return ret;
 }
@@ -2014,6 +1961,9 @@ dma_reset_legacy(void)
     dma_sg_base = 0x0400;
     memset(dma_chain_mode, 0x00, sizeof(dma_chain_mode));
     dma_chain_int = 0x00;
+    dma_sg_int    = 0x00;
+    for (c = 0; c < 8; c++)
+        dma[c].sg_status = DMA_SG_BASE; /* 08h after reset (3.2.22) */
     dma_stop_en   = 0x00;
 
     dma_mask = 0x00ffffff;
@@ -2043,18 +1993,14 @@ dma_remove_sg(void)
                      NULL);
 
     for (uint8_t i = 0; i < 8; i++) {
+        if (i == 4)
+            continue; /* the cascade has none */
         io_removehandler(dma_sg_base + 0x10 + i, 0x01,
-                         dma_sg_read, dma_sg_readw, dma_sg_readl,
-                         dma_sg_write, dma_sg_writew, dma_sg_writel,
-                         &dma[i]);
+                         dma_sg_read, NULL, NULL, dma_sg_write, NULL, NULL, NULL);
         io_removehandler(dma_sg_base + 0x18 + i, 0x01,
-                         dma_sg_read, dma_sg_readw, dma_sg_readl,
-                         dma_sg_write, dma_sg_writew, dma_sg_writel,
-                         &dma[i]);
+                         dma_sg_read, NULL, NULL, dma_sg_write, NULL, NULL, NULL);
         io_removehandler(dma_sg_base + 0x20 + i * 4, 0x04,
-                         dma_sg_read, dma_sg_readw, dma_sg_readl,
-                         dma_sg_write, dma_sg_writew, dma_sg_writel,
-                         &dma[i]);
+                         dma_sg_read, NULL, NULL, dma_sg_write, NULL, NULL, NULL);
     }
 }
 
@@ -2069,18 +2015,14 @@ dma_set_sg_base(uint8_t sg_base)
                   NULL);
 
     for (uint8_t i = 0; i < 8; i++) {
+        if (i == 4)
+            continue; /* the cascade has none */
         io_sethandler(dma_sg_base + 0x10 + i, 0x01,
-                      dma_sg_read, dma_sg_readw, dma_sg_readl,
-                      dma_sg_write, dma_sg_writew, dma_sg_writel,
-                      &dma[i]);
+                      dma_sg_read, NULL, NULL, dma_sg_write, NULL, NULL, NULL);
         io_sethandler(dma_sg_base + 0x18 + i, 0x01,
-                      dma_sg_read, dma_sg_readw, dma_sg_readl,
-                      dma_sg_write, dma_sg_writew, dma_sg_writel,
-                      &dma[i]);
+                      dma_sg_read, NULL, NULL, dma_sg_write, NULL, NULL, NULL);
         io_sethandler(dma_sg_base + 0x20 + i * 4, 0x04,
-                      dma_sg_read, dma_sg_readw, dma_sg_readl,
-                      dma_sg_write, dma_sg_writew, dma_sg_writel,
-                      &dma[i]);
+                      dma_sg_read, NULL, NULL, dma_sg_write, NULL, NULL, NULL);
     }
 }
 
@@ -2150,8 +2092,7 @@ dma_chain_mode_write(uint16_t addr, uint8_t val, UNUSED(void *priv))
        the interrupt. */
     if ((val & 0x08) || !(val & 0x04)) {
         dma_chain_int &= ~(1 << channel);
-        if (!dma_chain_int)
-            picintc(1 << 13);
+        dma_irq13_update();
     }
 }
 
@@ -2236,7 +2177,7 @@ dma_eisa_init(void)
     io_sethandler(0x04e0, 32, dma_stop_read, NULL, NULL,
                   dma_stop_write, NULL, NULL, NULL);
 
-    dma_sg_count_mask = 0x00fffffe;
+    dma_sg_count_mask = 0x00ffffff;
     dma_eisa          = 1;
 }
 
@@ -2364,71 +2305,6 @@ ps2_dma_init(void)
                   dma_ps2_arb_read, NULL, NULL, dma_ps2_arb_write, NULL, NULL, NULL);
 }
 
-extern void dma_bm_read(uint32_t PhysAddress, uint8_t *DataRead, uint32_t TotalSize, int TransferSize);
-extern void dma_bm_write(uint32_t PhysAddress, const uint8_t *DataWrite, uint32_t TotalSize, int TransferSize);
-
-static int
-dma_sg(uint8_t *data, int transfer_length, int out, void *priv)
-{
-    dma_t *dev = (dma_t *) priv;
-#ifdef ENABLE_DMA_LOG
-    char *sop;
-#endif
-
-    int force_end = 0;
-    int buffer_pos = 0;
-
-#ifdef ENABLE_DMA_LOG
-    sop = out ? "Read" : "Writ";
-#endif
-
-    if (!(dev->sg_status & 1))
-        return 2; /*S/G disabled*/
-
-    dma_log("DMA S/G %s: %i bytes\n", out ? "write" : "read", transfer_length);
-
-    while (1) {
-        if (dev->count <= transfer_length) {
-            dma_log("%sing %i bytes to %08X\n", sop, dev->count, dev->addr);
-            if (out)
-                dma_bm_read(dev->addr, (uint8_t *) (data + buffer_pos), dev->count, 4);
-            else
-                dma_bm_write(dev->addr, (uint8_t *) (data + buffer_pos), dev->count, 4);
-            transfer_length -= dev->count;
-            buffer_pos += dev->count;
-        } else {
-            dma_log("%sing %i bytes to %08X\n", sop, transfer_length, dev->addr);
-            if (out)
-                dma_bm_read(dev->addr, (uint8_t *) (data + buffer_pos), transfer_length, 4);
-            else
-                dma_bm_write(dev->addr, (uint8_t *) (data + buffer_pos), transfer_length, 4);
-            /* Increase addr and decrease count so that resumed transfers do not mess up. */
-            dev->addr += transfer_length;
-            dev->count -= transfer_length;
-            transfer_length = 0;
-            force_end       = 1;
-        }
-
-        if (force_end) {
-            dma_log("Total transfer length smaller than sum of all blocks, partial block\n");
-            return 1; /* This block has exhausted the data to transfer and it was smaller than the count, break. */
-        } else {
-            if (!transfer_length && !dev->eot) {
-                dma_log("Total transfer length smaller than sum of all blocks, full block\n");
-                return 1; /* We have exhausted the data to transfer but there's more blocks left, break. */
-            } else if (transfer_length && dev->eot) {
-                dma_log("Total transfer length greater than sum of all blocks\n");
-                return 4; /* There is data left to transfer but we have reached EOT - return with error. */
-            } else if (dev->eot) {
-                dma_log("Regular EOT\n");
-                return 5; /* We have regularly reached EOT - clear status and break. */
-            } else {
-                /* We have more to transfer and there are blocks left, get next block. */
-                dma_sg_next_addr(dev);
-            }
-        }
-    }
-}
 
 uint8_t
 _dma_read(uint32_t addr, dma_t *dma_c)
@@ -2436,10 +2312,7 @@ _dma_read(uint32_t addr, dma_t *dma_c)
     uint8_t temp = 0;
 
     if (dma_advanced) {
-        if (dma_c->sg_status & 1)
-            dma_c->sg_status = (dma_c->sg_status & 0x0f) | (dma_sg(&temp, 1, 1, dma_c) << 4);
-        else
-            dma_bm_read(addr, &temp, 1, dma_transfer_size(dma_c));
+        dma_bm_read(addr, &temp, 1, dma_transfer_size(dma_c));
     } else
         temp = mem_readb_phys(addr);
 
@@ -2452,10 +2325,7 @@ _dma_readw(uint32_t addr, dma_t *dma_c)
     uint16_t temp = 0;
 
     if (dma_advanced) {
-        if (dma_c->sg_status & 1)
-            dma_c->sg_status = (dma_c->sg_status & 0x0f) | (dma_sg((uint8_t *) &temp, 2, 1, dma_c) << 4);
-        else
-            dma_bm_read(addr, (uint8_t *) &temp, 2, dma_transfer_size(dma_c));
+        dma_bm_read(addr, (uint8_t *) &temp, 2, dma_transfer_size(dma_c));
     } else
         temp = _dma_read(addr, dma_c) | (_dma_read(addr + 1, dma_c) << 8);
 
@@ -2466,10 +2336,7 @@ static void
 _dma_write(uint32_t addr, uint8_t val, dma_t *dma_c)
 {
     if (dma_advanced) {
-        if (dma_c->sg_status & 1)
-            dma_c->sg_status = (dma_c->sg_status & 0x0f) | (dma_sg(&val, 1, 0, dma_c) << 4);
-        else
-            dma_bm_write(addr, &val, 1, dma_transfer_size(dma_c));
+        dma_bm_write(addr, &val, 1, dma_transfer_size(dma_c));
     } else {
         mem_writeb_phys(addr, val);
         if (dma_at)
@@ -2481,10 +2348,7 @@ static void
 _dma_writew(uint32_t addr, uint16_t val, dma_t *dma_c)
 {
     if (dma_advanced) {
-        if (dma_c->sg_status & 1)
-            dma_c->sg_status = (dma_c->sg_status & 0x0f) | (dma_sg((uint8_t *) &val, 2, 0, dma_c) << 4);
-        else
-            dma_bm_write(addr, (uint8_t *) &val, 2, dma_transfer_size(dma_c));
+        dma_bm_write(addr, (uint8_t *) &val, 2, dma_transfer_size(dma_c));
     } else {
         _dma_write(addr, val & 0xff, dma_c);
         _dma_write(addr + 1, val >> 8, dma_c);
@@ -2496,10 +2360,7 @@ _dma_readl(uint32_t addr, dma_t *dma_c)
 {
     uint32_t temp = 0;
 
-    if (dma_c->sg_status & 1)
-        dma_c->sg_status = (dma_c->sg_status & 0x0f) | (dma_sg((uint8_t *) &temp, 4, 1, dma_c) << 4);
-    else
-        dma_bm_read(addr, (uint8_t *) &temp, 4, dma_transfer_size(dma_c));
+    dma_bm_read(addr, (uint8_t *) &temp, 4, dma_transfer_size(dma_c));
 
     return temp;
 }
@@ -2507,17 +2368,14 @@ _dma_readl(uint32_t addr, dma_t *dma_c)
 static void
 _dma_writel(uint32_t addr, uint32_t val, dma_t *dma_c)
 {
-    if (dma_c->sg_status & 1)
-        dma_c->sg_status = (dma_c->sg_status & 0x0f) | (dma_sg((uint8_t *) &val, 4, 0, dma_c) << 4);
-    else
-        dma_bm_write(addr, (uint8_t *) &val, 4, dma_transfer_size(dma_c));
+    dma_bm_write(addr, (uint8_t *) &val, 4, dma_transfer_size(dma_c));
 }
 
 static void
 dma_retreat_n(dma_t *dma_c, int as)
 {
 
-    if (dma_c->sg_status & 1) {
+    if (dma_c->sg_status & DMA_SG_ACTIVE) {
         dma_c->ac = (dma_c->ac - as) & dma_mask;
 
         dma_c->page = dma_c->page_l = (dma_c->ac >> 16) & 0xff;
@@ -2545,7 +2403,7 @@ static void
 dma_advance_n(dma_t *dma_c, int as)
 {
 
-    if (dma_c->sg_status & 1) {
+    if (dma_c->sg_status & DMA_SG_ACTIVE) {
         dma_c->ac = (dma_c->ac + as) & dma_mask;
 
         dma_c->page = dma_c->page_l = (dma_c->ac >> 16) & 0xff;
@@ -2966,25 +2824,8 @@ dma_channel_32_finish(int channel, int n)
     dma_stop_check(channel);
 
     dma_c->cc -= dma_count_take(dma_c);
-    if (dma_c->cc < 0) {
-        if ((dma_c->sg_status & 1) && !(dma_c->sg_status & 6))
-            dma_sg_next_addr(dma_c);
-        else {
-            tc = 1;
-            dma_sw_req &= ~(1 << channel); /* TC clears the channel's software request */
-            if ((dma_c->mode & 0x10) || dma_chain_tc(channel)) {
-                dma_c->cc = dma_c->cb;
-                dma_c->ac = dma_c->ab;
-            } else
-                dma_m |= (1 << channel);
-            dma_stat |= (1 << channel);
-        }
-    }
-
-    if (tc && (dma_c->sg_status & 1) && ((dma_c->sg_command & 0xc0) == 0x40)) {
-        picint(1 << 13);
-        dma_c->sg_status |= 8;
-    }
+    if (dma_c->cc < 0)
+        tc = dma_count_out(channel);
 
     return tc ? DMA_OVER : 0;
 }
@@ -3008,6 +2849,7 @@ dma_channel_read32(int channel, uint32_t *val)
         return DMA_NODATA;
     if (dma_stat_adv_pend & (1 << channel))
         dma_channel_advance(channel);
+    dma_sg_load(dma_c);
 
     /* A partial dword at an unaligned start or at the end of the count. */
     n    = dma_xfer_bytes(dma_c);
@@ -3031,6 +2873,7 @@ dma_channel_write32(int channel, uint32_t val)
 
     if (!dma_channel_32_ready(channel, 0x04))
         return DMA_NODATA;
+    dma_sg_load(dma_c);
 
     n = dma_xfer_bytes(dma_c);
     if ((dma_c->mode & 0x0c) == 0x04) {
@@ -3098,6 +2941,7 @@ dma_channel_read_only_legacy(int channel)
         return (DMA_NODATA);
 
     dma_channel_advance(channel);
+    dma_sg_load(dma_c);
 
     if (!dma_at && !channel)
         is_nec ? refreshread_vx0() : refreshread();
@@ -3168,27 +3012,8 @@ dma_channel_advance_legacy(int channel)
         dma_stop_check(channel);
 
         dma_c->cc -= dma_count_take(dma_c);
-        if (dma_c->cc < 0) {
-            if (dma_advanced && (dma_c->sg_status & 1) && !(dma_c->sg_status & 6))
-                dma_sg_next_addr(dma_c);
-            else {
-                tc = 1;
-                dma_sw_req &= ~(1 << channel); /* TC clears the channel's software request */
-                if ((dma_c->mode & 0x10) || dma_chain_tc(channel)) { /*Auto-init, or the next link*/
-                    dma_c->cc = dma_c->cb;
-                    dma_c->ac = dma_c->ab;
-                } else
-                    dma_m |= (1 << channel);
-                dma_stat |= (1 << channel);
-            }
-        }
-
-        if (tc) {
-            if (dma_advanced && (dma_c->sg_status & 1) && ((dma_c->sg_command & 0xc0) == 0x40)) {
-                picint(1 << 13);
-                dma_c->sg_status |= 8;
-            }
-        }
+        if (dma_c->cc < 0)
+            tc = dma_count_out(channel);
 
         dma_stat_adv_pend &= ~(1 << channel);
     }
@@ -3215,6 +3040,7 @@ dma_channel_read_legacy(int channel)
 
     if (dma_stat_adv_pend & (1 << channel))
         dma_channel_advance(channel);
+    dma_sg_load(dma_c);
 
     if (!dma_at && !channel)
         is_nec ? refreshread_vx0() : refreshread();
@@ -3273,29 +3099,11 @@ dma_channel_read_legacy(int channel)
     dma_stop_check(channel);
 
     dma_c->cc -= dma_count_take(dma_c);
-    if (dma_c->cc < 0) {
-        if (dma_advanced && (dma_c->sg_status & 1) && !(dma_c->sg_status & 6))
-            dma_sg_next_addr(dma_c);
-        else {
-            tc = 1;
-            dma_sw_req &= ~(1 << channel); /* TC clears the channel's software request */
-            if ((dma_c->mode & 0x10) || dma_chain_tc(channel)) { /*Auto-init, or the next link*/
-                dma_c->cc = dma_c->cb;
-                dma_c->ac = dma_c->ab;
-            } else
-                dma_m |= (1 << channel);
-            dma_stat |= (1 << channel);
-        }
-    }
+    if (dma_c->cc < 0)
+        tc = dma_count_out(channel);
 
-    if (tc) {
-        if (dma_advanced && (dma_c->sg_status & 1) && ((dma_c->sg_command & 0xc0) == 0x40)) {
-            picint(1 << 13);
-            dma_c->sg_status |= 8;
-        }
-
+    if (tc)
         return (temp | DMA_OVER);
-    }
 
     return temp;
 }
@@ -3305,6 +3113,8 @@ dma_channel_write_legacy(int channel, uint16_t val)
 {
     dma_t *dma_c = &dma[channel];
     int    type;
+    int    sg;
+    int    tc = 0;
 
     if (dma_group_disabled(channel))
         return (DMA_NODATA);
@@ -3316,6 +3126,7 @@ dma_channel_write_legacy(int channel, uint16_t val)
     type = dma_c->mode & 0x0c;
     if ((type != 0x04) && (type != 0x00))
         return (DMA_NODATA);
+    dma_sg_load(dma_c);
 
     if (dma_eisa) {
         /* See the read: the width, or less at the ends of a count by bytes. */
@@ -3378,29 +3189,14 @@ dma_channel_write_legacy(int channel, uint16_t val)
 
     dma_stop_check(channel);
 
+    sg = dma_c->sg_status & DMA_SG_ACTIVE;
     dma_c->cc -= dma_count_take(dma_c);
-    if (dma_c->cc < 0) {
-        if (dma_advanced && (dma_c->sg_status & 1) && !(dma_c->sg_status & 6))
-            dma_sg_next_addr(dma_c);
-        else {
-            dma_sw_req &= ~(1 << channel); /* TC clears the channel's software request */
-            if ((dma_c->mode & 0x10) || dma_chain_tc(channel)) { /*Auto-init, or the next link*/
-                dma_c->cc = dma_c->cb;
-                dma_c->ac = dma_c->ab;
-            } else
-                dma_m |= (1 << channel);
-            dma_stat |= (1 << channel);
-        }
-    }
+    if (dma_c->cc < 0)
+        tc = dma_count_out(channel);
 
-    if (dma_m & (1 << channel)) {
-        if (dma_advanced && (dma_c->sg_status & 1) && ((dma_c->sg_command & 0xc0) == 0x40)) {
-            picint(1 << 13);
-            dma_c->sg_status |= 8;
-        }
-
+    /* A scatter-gather list ends with EOP only if it chose EOP. */
+    if (sg ? tc : (dma_m & (1 << channel)))
         return DMA_OVER;
-    }
 
     return 0;
 }
